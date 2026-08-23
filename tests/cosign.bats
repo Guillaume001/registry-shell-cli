@@ -139,6 +139,85 @@ load 'test_helper'
     grep -q "^v2/myimage/manifests/sha256:${digest_hex}\$" listing.txt
     grep -q "^v2/myimage/manifests/sha256:${ref1_digest}\$" listing.txt
     grep -q "^v2/myimage/manifests/sha256:${ref2_digest}\$" listing.txt
+    # Chaque entrée de l'index referrers reçoit aussi un tag compagnon nu
+    # (sha256-<son-propre-digest>), reconnu par is_cosign_companion_tag --
+    # sans ça, sa copie canonique réapparaîtrait comme une fausse image
+    # "(sans tag)" dans 'list'/'index' (voir le test dédié plus bas).
+    grep -q "^v2/myimage/manifests/sha256-${ref1_digest}\$" listing.txt
+    grep -q "^v2/myimage/manifests/sha256-${ref2_digest}\$" listing.txt
+}
+
+@test "pull --with-signatures sur un pull par digest seul : les artefacts cosign n'apparaissent jamais comme de fausses images dans list/index" {
+    cd "$BATS_TEST_TMPDIR"
+    local fakebin="${BATS_TEST_TMPDIR}/fakebin"
+    install_fake_skopeo "$fakebin"
+
+    # Contenu distinct pour CHAQUE artefact (image, sig, att, sbom, deux
+    # referrers) : reproduit un cas réel où ces manifestes n'ont jamais le
+    # même contenu/digest que l'image elle-même (contrairement à un simple
+    # réemploi de build_skopeo_dir, qui produit toujours un contenu fixe).
+    make_variant_skopeo_dir() {
+        local dest="$1" label="$2"
+        mkdir -p "$dest"
+        local cfg="{\"architecture\":\"amd64\",\"os\":\"linux\",\"variant\":\"${label}\"}"
+        printf '%s' "$cfg" > "${dest}/cfgtmp"
+        local cd; cd="$(sha256sum "${dest}/cfgtmp" | cut -d' ' -f1)"
+        mv "${dest}/cfgtmp" "${dest}/${cd}"
+        printf 'layer-%s' "$label" > "${dest}/layertmp"
+        local ld; ld="$(sha256sum "${dest}/layertmp" | cut -d' ' -f1)"
+        mv "${dest}/layertmp" "${dest}/${ld}"
+        printf '{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"digest":"sha256:%s"},"layers":[{"digest":"sha256:%s"}]}' \
+            "$cd" "$ld" > "${dest}/manifest.json"
+    }
+
+    make_variant_skopeo_dir main-src main
+    make_variant_skopeo_dir sig-src sig
+    make_variant_skopeo_dir att-src att
+    make_variant_skopeo_dir sbom-src sbom
+    make_variant_skopeo_dir ref1-src ref1
+    make_variant_skopeo_dir ref2-src ref2
+
+    local digest_hex ref1_digest ref2_digest
+    digest_hex="$(sha256sum main-src/manifest.json | cut -d' ' -f1)"
+    ref1_digest="$(sha256sum ref1-src/manifest.json | cut -d' ' -f1)"
+    ref2_digest="$(sha256sum ref2-src/manifest.json | cut -d' ' -f1)"
+
+    mkdir -p index-src
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:%s"},{"digest":"sha256:%s"}]}' \
+        "$ref1_digest" "$ref2_digest" > index-src/manifest.json
+
+    local map="${BATS_TEST_TMPDIR}/skopeo-map.tsv"
+    {
+        printf '@sha256:%s\t%s\n' "$digest_hex" "${BATS_TEST_TMPDIR}/main-src"
+        printf '.sig\t%s\n' "${BATS_TEST_TMPDIR}/sig-src"
+        printf '.att\t%s\n' "${BATS_TEST_TMPDIR}/att-src"
+        printf '.sbom\t%s\n' "${BATS_TEST_TMPDIR}/sbom-src"
+        printf ':sha256-%s\t%s\n' "$digest_hex" "${BATS_TEST_TMPDIR}/index-src"
+        printf '@sha256:%s\t%s\n' "$ref1_digest" "${BATS_TEST_TMPDIR}/ref1-src"
+        printf '@sha256:%s\t%s\n' "$ref2_digest" "${BATS_TEST_TMPDIR}/ref2-src"
+    } > "$map"
+
+    PATH="${fakebin}:${PATH}" FAKE_SKOPEO_MAP="$map" \
+        "$REGISTRY_CLI" pull -i myimage --digest "sha256:${digest_hex}" \
+        --with-signatures -o out.tar.gz --no-expand >/dev/null
+
+    local root="${BATS_TEST_TMPDIR}/registry"
+    "$REGISTRY_CLI" upload -a out.tar.gz -r "$root" >/dev/null
+
+    run "$REGISTRY_CLI" list -r "$root" --json
+    [ "$status" -eq 0 ]
+    # Une SEULE entrée : l'image elle-même (tag vide, digest-only pull),
+    # pas une par artefact cosign (sig/att/sbom/index/referrers).
+    local n
+    n="$(echo "$output" | jq 'length')"
+    [ "$n" -eq 1 ]
+    echo "$output" | jq -e --arg d "sha256:${digest_hex}" \
+        '.[0].digest == $d and .[0].signature == true and .[0].attestation == true and .[0].sbom == true' >/dev/null
+
+    # Idem côté index.html : une seule entrée "tag" dans les données JSON embarquées.
+    local tag_entries
+    tag_entries="$(grep -o '"tag":"[^"]*"' "${root}/index.html" | wc -l | tr -d ' ')"
+    [ "$tag_entries" -eq 1 ]
 }
 
 # --- list/index : filtrage des tags compagnons + badges signé/SBOM --------
