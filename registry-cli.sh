@@ -43,7 +43,17 @@ Commandes :
   list        Liste les images et tags disponibles dans une registry
   remove      Supprime un tag ou une image entière d'une registry
   index       (Re)génère la page index.html à la racine de la registry
+  verify      Vérifie la signature cosign d'une image (clé publique)
+  sbom        Extrait un SBOM CycloneDX attesté (cosign) au format JSON
   completion  Affiche le script d'auto-complétion bash (voir plus bas)
+
+Signatures et SBOM (cosign) :
+  'pull --with-signatures' (ou --sig-from-dir/--att-from-dir/--sbom-from-dir
+  pour un usage 100% offline) récupère et conserve les artefacts cosign
+  associés à une image (signature, attestation, SBOM) au même titre que
+  n'importe quel autre tag de la registry. 'verify' et 'sbom' parlent le
+  protocole HTTP OCI Distribution et ciblent donc l'URL où la registry est
+  SERVIE (Apache2), pas un chemin local -- voir '${SCRIPT_NAME} verify --help'.
 
 Ce script est 100% autonome : aucune connexion réseau n'est requise en
 dehors de skopeo lui-même pour 'pull' (utilisez --from-dir pour même s'en
@@ -58,9 +68,12 @@ Auto-complétion bash (le script est auto-suffisant, rien à télécharger en pl
 
 Exemples :
   ${SCRIPT_NAME} pull -i alpine -t 3.20 -o alpine-3.20.tar.gz -k 0xDEADBEEF
+  ${SCRIPT_NAME} pull -i alpine -t 3.20 --with-signatures -o alpine-3.20.tar.gz
   ${SCRIPT_NAME} upload -a alpine-3.20.tar.gz -r /srv/registrish
   ${SCRIPT_NAME} list -r /srv/registrish
   ${SCRIPT_NAME} remove -r /srv/registrish --image alpine --tag 3.19 --gc
+  ${SCRIPT_NAME} verify -u registry.example.com -i alpine -t 3.20 -k cosign.pub
+  ${SCRIPT_NAME} sbom -u registry.example.com -i alpine -t 3.20 -k cosign.pub -o alpine.cdx.json
 EOF
 }
 
@@ -150,6 +163,25 @@ read_media_type() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Utilitaire partagé : reconnaît le nom d'un tag "compagnon" cosign, c'est-à-
+# dire un artefact stocké comme un tag ordinaire mais qui n'est pas un tag
+# d'image destiné à l'utilisateur :
+#   - convention historique "tag-based" de cosign : sha256-<digest>.sig
+#     (signature), .att (attestation in-toto, peut embarquer un SBOM), .sbom
+#     (SBOM attaché directement, ancienne convention)
+#   - repli statique OCI 1.1 "referrers" : sha256-<digest> (sans suffixe),
+#     un index listant les manifestes qui référencent cette image (signatures
+#     et/ou attestations poussées en mode OCI 1.1 quand la registry ne
+#     supporte pas l'API Referrers dynamique -- ce qui est le cas ici,
+#     Apache2 ne servant que des fichiers statiques)
+# Utilisé pour exclure ces entrées de la liste des tags "normaux" dans
+# 'list'/'index', et pour retrouver les artefacts associés à un tag donné.
+# ---------------------------------------------------------------------------
+is_cosign_companion_tag() {
+    [[ "$1" =~ ^sha256-[0-9a-f]{64}(\.sig|\.att|\.sbom)?$ ]]
+}
+
 # ===========================================================================
 # Conversion "skopeo dir:" -> arborescence registry v2/<image>/{blobs,manifests}
 #
@@ -205,6 +237,69 @@ convert_skopeo_dir_to_v2() {
                 ;;
         esac
     done
+    return 0
+}
+
+# ===========================================================================
+# Artefacts cosign (signature / attestation / SBOM) — voir 'pull --help' et
+# la note "Signatures et SBOM (cosign)" de l'aide générale.
+#
+# Ces artefacts sont de simples tags supplémentaires dans le même dépôt que
+# l'image (convention historique sha256-<digest>.sig/.att/.sbom, ou repli
+# statique OCI 1.1 via le tag "referrers" sha256-<digest>) : ils transitent
+# donc par le même convert_skopeo_dir_to_v2 que n'importe quel tag normal.
+# ===========================================================================
+
+# Intègre un artefact cosign déjà téléchargé hors-ligne (répertoire
+# "skopeo dir:", ex. produit sur une machine connectée puis transféré) sous
+# le nom de tag "compagnon" attendu (ex: sha256-<digest>.sig).
+add_cosign_artifact_from_dir() {
+    local src_dir="$1" image="$2" companion_tag="$3" v2_root="$4"
+    [[ -f "${src_dir}/manifest.json" ]] || {
+        echo "Erreur : ${src_dir}/manifest.json introuvable (artefact cosign --*-from-dir invalide : ${src_dir})." >&2
+        return 1
+    }
+    convert_skopeo_dir_to_v2 "$src_dir" "$image" "$companion_tag" "$v2_root"
+}
+
+# Tente de télécharger (skopeo) un tag "compagnon" cosign pour l'image
+# donnée (ex: sha256-<digest>.sig). Retourne silencieusement 1 si le tag
+# n'existe pas côté source : la plupart des images ne sont ni signées ni
+# attestées, ce n'est pas une erreur.
+try_pull_cosign_tag() {
+    local source_ref="$1" image="$2" companion_tag="$3" v2_root="$4" dest_dir="$5"
+    mkdir -p "$dest_dir"
+    skopeo copy "${source_ref}:${companion_tag}" "dir:${dest_dir}" \
+        >"${dest_dir}.log" 2>&1 || return 1
+    convert_skopeo_dir_to_v2 "$dest_dir" "$image" "$companion_tag" "$v2_root"
+}
+
+# Télécharge (skopeo) le tag de repli statique OCI 1.1 "referrers"
+# (sha256-<digest>, sans suffixe) s'il existe, puis récursivement chaque
+# manifeste qu'il référence (signatures/attestations poussées en mode
+# OCI 1.1 quand la registry source ne supporte pas l'API Referrers
+# dynamique). Best-effort : absence silencieuse si le tag n'existe pas.
+pull_oci_referrers_fallback() {
+    local source_ref="$1" image="$2" digest_hex="$3" v2_root="$4" workdir="$5"
+    local referrers_tag="sha256-${digest_hex}"
+    local referrers_dir="${workdir}/cosign-referrers-index"
+    mkdir -p "$referrers_dir"
+    skopeo copy "${source_ref}:${referrers_tag}" "dir:${referrers_dir}" \
+        >"${referrers_dir}.log" 2>&1 || return 1
+
+    convert_skopeo_dir_to_v2 "$referrers_dir" "$image" "" "$v2_root"
+
+    local d n=0 referrer_dir
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        n=$((n + 1))
+        referrer_dir="${workdir}/cosign-referrer-${n}"
+        mkdir -p "$referrer_dir"
+        if skopeo copy "${source_ref}@sha256:${d}" "dir:${referrer_dir}" \
+            >"${referrer_dir}.log" 2>&1; then
+            convert_skopeo_dir_to_v2 "$referrer_dir" "$image" "" "$v2_root"
+        fi
+    done < <(extract_referenced_digests "${referrers_dir}/manifest.json")
     return 0
 }
 
@@ -347,7 +442,8 @@ regen_index_html() {
     local index_file="${root}/index.html"
 
     local manifest_dir image_dir image_name blobs_dir blob_count
-    local tag_file tag_name digest size mtime platforms
+    local tag_file tag_name digest digest_hex size mtime platforms
+    local has_sig has_att has_sbom
     local entries=()
 
     while IFS= read -r manifest_dir; do
@@ -360,13 +456,19 @@ regen_index_html() {
         while IFS= read -r tag_file; do
             tag_name="$(basename "$tag_file")"
             [[ "$tag_name" == sha256:* ]] && continue
+            is_cosign_companion_tag "$tag_name" && continue
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
+            digest_hex="${digest#sha256:}"
             size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo 0)"
             mtime="$(date -u -r "$tag_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
             platforms="$(get_manifest_platforms "$tag_file" "$blobs_dir")"
-            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s"}' \
+            has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
+            has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
+            has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
+            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
                 "$(escape_json_string "$image_name")" "$(escape_json_string "$tag_name")" \
-                "$digest" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime")")
+                "$digest" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
+                "$has_sig" "$has_att" "$has_sbom")")
         done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' 2>/dev/null | sort)
     done < <(find "${root}/v2" -type d -name manifests 2>/dev/null | sort)
 
@@ -426,6 +528,7 @@ regen_index_html() {
   .digest.copied { color: var(--good); }
   .badge { display:inline-block; background: rgba(255,255,255,.06); border:1px solid var(--border);
            padding:.1rem .5rem; border-radius:99px; font-size:.72rem; margin:.1rem .25rem .1rem 0; color: var(--text-dim); }
+  .badge-cosign { background: rgba(91,217,126,.12); border-color: rgba(91,217,126,.35); color: var(--good); }
   .empty { text-align:center; padding: 3rem; color: var(--text-dim); }
   footer { margin-top:1.5rem; color: var(--text-dim); font-size:.75rem; }
   ::selection { background: rgba(91,157,255,.35); }
@@ -448,6 +551,7 @@ regen_index_html() {
       <th data-key="tag">Tag</th>
       <th data-key="platforms">Architecture(s)</th>
       <th data-key="digest">Digest</th>
+      <th>Cosign</th>
       <th data-key="blobs">Blobs</th>
       <th data-key="size">Taille manifest</th>
       <th data-key="mtime">Modifié</th>
@@ -515,11 +619,18 @@ function render() {
         const platformBadges = r.platforms.split(",").map(p => p.trim()).filter(Boolean)
             .map(p => `<span class="badge">${p}</span>`).join("");
 
+        const cosignBadges = [
+            r.signed ? '<span class="badge badge-cosign" title="Signature cosign présente (sha256-&lt;digest&gt;.sig)">🔏 signé</span>' : '',
+            r.attested ? '<span class="badge badge-cosign" title="Attestation cosign présente (sha256-&lt;digest&gt;.att)">📎 attesté</span>' : '',
+            r.sbom ? '<span class="badge badge-cosign" title="SBOM présent (sha256-&lt;digest&gt;.sbom)">📄 SBOM</span>' : '',
+        ].join("") || '<span class="badge">—</span>';
+
         tr.innerHTML = `
             <td class="image-name">${r.image}</td>
             <td><span class="tag">${r.tag}</span></td>
             <td>${platformBadges || '<span class="badge">unknown</span>'}</td>
             <td class="digest" title="${r.digest} (cliquer pour copier)" data-digest="${r.digest}">${shortDigest(r.digest)}</td>
+            <td>${cosignBadges}</td>
             <td>${r.blobs}</td>
             <td>${humanSize(r.size)}</td>
             <td>${humanDate(r.mtime)}</td>
@@ -622,6 +733,27 @@ Options :
                                Uniquement appliqué quand --source vaut "docker://".
       --keep-workdir          Ne pas supprimer le répertoire de travail temporaire
 
+Signatures et SBOM (cosign) — voir aussi '${SCRIPT_NAME} --help' :
+      --with-signatures        Recherche et embarque (via skopeo, en plus de
+                                 l'image) les artefacts cosign associés :
+                                 signature (sha256-<digest>.sig), attestation
+                                 (.att, peut contenir un SBOM CycloneDX),
+                                 SBOM legacy (.sbom), et le repli statique OCI
+                                 1.1 "referrers" (sha256-<digest> + chaque
+                                 manifeste qu'il référence). Chaque artefact
+                                 absent est ignoré silencieusement (toutes les
+                                 images ne sont pas signées). Nécessite skopeo
+                                 (incompatible avec --from-dir seul, sauf à
+                                 combiner avec les options --*-from-dir
+                                 ci-dessous pour rester 100% offline).
+      --sig-from-dir DIR        Équivalent 100% offline pour la signature
+                                 seule : DIR est un répertoire "skopeo dir:"
+                                 déjà produit pour le tag sha256-<digest>.sig
+                                 correspondant à cette image (le digest de
+                                 l'image venant d'être téléchargée/convertie).
+      --att-from-dir DIR        Idem pour l'attestation (.att).
+      --sbom-from-dir DIR       Idem pour le SBOM legacy (.sbom).
+
 Exemples :
   ${SCRIPT_NAME} pull -i alpine -t 3.20                        # -> docker.io/library/alpine, archive docker.io-library-alpine-3.20-amd64.tar.gz
   ${SCRIPT_NAME} pull -i dxflrs/garage -t v1.0.1                # -> docker.io/dxflrs/garage
@@ -630,12 +762,14 @@ Exemples :
   ${SCRIPT_NAME} pull -i alpine -t 3.20 -d sha256:abcd...        # tag + digest exact combinés
   ${SCRIPT_NAME} pull -i alpine -t 3.20 --arch all               # -> alpine-3.20-all.tar.gz
   ${SCRIPT_NAME} pull -i alpine -t 3.20 -o custom.tar.gz --from-dir /tmp/skopeo-alpine
+  ${SCRIPT_NAME} pull -i alpine -t 3.20 --with-signatures        # embarque signature/attestation/SBOM si présentes
 EOF
 }
 
 cmd_pull() {
     local image="" tag="" digest="" output="" gpg_key="" from_dir=""
     local source_prefix="docker://" arch="amd64" os="linux" keep_workdir="false" no_expand="false"
+    local with_signatures="false" sig_from_dir="" att_from_dir="" sbom_from_dir=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -650,6 +784,10 @@ cmd_pull() {
             --os) os="$2"; shift 2 ;;
             --no-expand) no_expand="true"; shift ;;
             --keep-workdir) keep_workdir="true"; shift ;;
+            --with-signatures) with_signatures="true"; shift ;;
+            --sig-from-dir) sig_from_dir="$2"; shift 2 ;;
+            --att-from-dir) att_from_dir="$2"; shift 2 ;;
+            --sbom-from-dir) sbom_from_dir="$2"; shift 2 ;;
             -h|--help) usage_pull; exit 0 ;;
             *) echo "Option inconnue pour 'pull' : $1" >&2; exit 1 ;;
         esac
@@ -746,6 +884,67 @@ cmd_pull() {
     local v2_root="${workdir}/v2"
     mkdir -p "$v2_root"
     convert_skopeo_dir_to_v2 "$skopeo_dest" "$image" "$tag" "$v2_root" || exit 1
+
+    # --- Artefacts cosign (signature/attestation/SBOM), si demandés ---
+    local image_digest_hex=""
+    local -a bundled_cosign_artifacts=()
+    if [[ "$with_signatures" == "true" || -n "$sig_from_dir" || -n "$att_from_dir" || -n "$sbom_from_dir" ]]; then
+        image_digest_hex="$(sha256sum "${skopeo_dest}/manifest.json" | cut -d' ' -f1)"
+
+        if [[ -n "$sig_from_dir" ]]; then
+            add_cosign_artifact_from_dir "$sig_from_dir" "$image" "sha256-${image_digest_hex}.sig" "$v2_root" || exit 1
+            bundled_cosign_artifacts+=("sha256-${image_digest_hex}.sig (--sig-from-dir)")
+        fi
+        if [[ -n "$att_from_dir" ]]; then
+            add_cosign_artifact_from_dir "$att_from_dir" "$image" "sha256-${image_digest_hex}.att" "$v2_root" || exit 1
+            bundled_cosign_artifacts+=("sha256-${image_digest_hex}.att (--att-from-dir)")
+        fi
+        if [[ -n "$sbom_from_dir" ]]; then
+            add_cosign_artifact_from_dir "$sbom_from_dir" "$image" "sha256-${image_digest_hex}.sbom" "$v2_root" || exit 1
+            bundled_cosign_artifacts+=("sha256-${image_digest_hex}.sbom (--sbom-from-dir)")
+        fi
+
+        if [[ "$with_signatures" == "true" ]]; then
+            command -v skopeo >/dev/null 2>&1 || { echo "Erreur : --with-signatures nécessite 'skopeo'." >&2; exit 1; }
+            echo "==> Recherche des artefacts cosign associés (signature/attestation/SBOM/referrers)..."
+
+            local companion companion_dir suffix
+            for suffix in sig att sbom; do
+                companion="sha256-${image_digest_hex}.${suffix}"
+                # Ne re-tente pas un artefact déjà fourni via --*-from-dir.
+                case "$suffix" in
+                    sig) [[ -n "$sig_from_dir" ]] && continue ;;
+                    att) [[ -n "$att_from_dir" ]] && continue ;;
+                    sbom) [[ -n "$sbom_from_dir" ]] && continue ;;
+                esac
+                companion_dir="${workdir}/cosign-${suffix}"
+                if try_pull_cosign_tag "${source_prefix}${image}" "$image" "$companion" "$v2_root" "$companion_dir"; then
+                    echo "    trouvé : ${companion}"
+                    bundled_cosign_artifacts+=("$companion")
+                else
+                    echo "    absent : ${companion}"
+                fi
+            done
+
+            echo "    recherche du repli statique OCI 1.1 'referrers' (sha256-${image_digest_hex})..."
+            if pull_oci_referrers_fallback "${source_prefix}${image}" "$image" "$image_digest_hex" "$v2_root" "$workdir"; then
+                echo "    trouvé : index de referrers et ses entrées référencées"
+                bundled_cosign_artifacts+=("sha256-${image_digest_hex} (index referrers OCI 1.1)")
+            else
+                echo "    absent : index de referrers"
+            fi
+        fi
+
+        if [[ "${#bundled_cosign_artifacts[@]}" -gt 0 ]]; then
+            echo "==> Artefacts cosign embarqués :"
+            local a
+            for a in "${bundled_cosign_artifacts[@]}"; do
+                echo "    - ${a}"
+            done
+        else
+            echo "==> Aucun artefact cosign trouvé pour cette image."
+        fi
+    fi
 
     local created_at arch_label
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -951,7 +1150,8 @@ cmd_list() {
     [[ -d "${root}/v2" ]] || { echo "Erreur : ${root}/v2 introuvable (registry vide ou invalide)." >&2; exit 1; }
 
     local rows=()
-    local manifest_dir image_dir image_name blobs_dir blob_count tag_file tag_name digest size mtime
+    local manifest_dir image_dir image_name blobs_dir blob_count tag_file tag_name digest digest_hex size mtime
+    local has_sig has_att has_sbom cosign_summary
 
     while IFS= read -r manifest_dir; do
         image_dir="$(dirname "$manifest_dir")"
@@ -963,10 +1163,20 @@ cmd_list() {
         while IFS= read -r tag_file; do
             tag_name="$(basename "$tag_file")"
             [[ "$tag_name" == sha256:* ]] && continue
+            is_cosign_companion_tag "$tag_name" && continue
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
+            digest_hex="${digest#sha256:}"
             size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo "?")"
             mtime="$(date -u -r "$tag_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?")"
-            rows+=("${image_name}|${tag_name}|${digest}|${blob_count}|${size}|${mtime}")
+            has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
+            has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
+            has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
+            cosign_summary=""
+            [[ "$has_sig" == "true" ]] && cosign_summary="sig"
+            [[ "$has_att" == "true" ]] && cosign_summary="${cosign_summary:+${cosign_summary},}att"
+            [[ "$has_sbom" == "true" ]] && cosign_summary="${cosign_summary:+${cosign_summary},}sbom"
+            [[ -z "$cosign_summary" ]] && cosign_summary="-"
+            rows+=("${image_name}|${tag_name}|${digest}|${cosign_summary}|${has_sig}|${has_att}|${has_sbom}|${blob_count}|${size}|${mtime}")
         done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' | sort)
     done < <(find "${root}/v2" -type d -name manifests | sort)
 
@@ -980,18 +1190,19 @@ cmd_list() {
         echo "["
         local n="${#rows[@]}" i=0
         for row in "${rows[@]}"; do
-            IFS='|' read -r image tag digest blobs size mtime <<< "$row"
+            IFS='|' read -r image tag digest cosign_summary has_sig has_att has_sbom blobs size mtime <<< "$row"
             i=$((i+1))
-            printf '  {"image": "%s", "tag": "%s", "digest": "%s", "blobs": %s, "manifest_size": %s, "last_modified": "%s"}%s\n' \
-                "$image" "$tag" "$digest" "$blobs" "$size" "$mtime" \
+            printf '  {"image": "%s", "tag": "%s", "digest": "%s", "signature": %s, "attestation": %s, "sbom": %s, "blobs": %s, "manifest_size": %s, "last_modified": "%s"}%s\n' \
+                "$image" "$tag" "$digest" "$has_sig" "$has_att" "$has_sbom" "$blobs" "$size" "$mtime" \
                 "$([[ $i -lt $n ]] && echo ',')"
         done
         echo "]"
     else
         {
-            printf 'IMAGE\tTAG\tDIGEST\tBLOBS\tMANIFEST_SIZE\tLAST_MODIFIED\n'
+            printf 'IMAGE\tTAG\tDIGEST\tCOSIGN\tBLOBS\tMANIFEST_SIZE\tLAST_MODIFIED\n'
             for row in "${rows[@]}"; do
-                echo "$row" | tr '|' '\t'
+                IFS='|' read -r image tag digest cosign_summary has_sig has_att has_sbom blobs size mtime <<< "$row"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$image" "$tag" "$digest" "$cosign_summary" "$blobs" "$size" "$mtime"
             done
         } | if command -v column >/dev/null 2>&1; then
                 column -t -s $'\t'
@@ -1324,6 +1535,238 @@ cmd_index() {
 }
 
 # ===========================================================================
+# Commande : verify
+#
+# Vérifie une signature cosign. Contrairement à toutes les autres commandes,
+# 'verify' ne touche JAMAIS un chemin local : cosign parle le protocole HTTP
+# "OCI Distribution" (GET /v2/<name>/manifests/<ref>, etc.), donc la cible
+# est forcément l'URL où v2/ est réellement SERVI (Apache2), construite comme
+# "${registry_url}/${image}:${tag}" (ou "@${digest}").
+#
+# Volontairement limité à la vérification par CLÉ PUBLIQUE (pas de mode
+# "keyless" Rekor/Fulcio) : c'est le seul mode compatible avec l'usage 100%
+# offline de cet outil, la vérification keyless nécessitant un accès réseau
+# à la transparence Sigstore publique au moment même de la vérification.
+# ===========================================================================
+usage_verify() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} verify -u REGISTRY_URL -i IMAGE (-t TAG | -d DIGEST) -k CLE_PUBLIQUE [options] [-- ARGS_COSIGN...]
+
+Options obligatoires :
+  -u, --registry-url HOTE[:PORT]  Hôte de la registry telle que SERVIE en
+                                    HTTP(S) (ex: registry.example.com,
+                                    localhost:8080) -- PAS le chemin
+                                    filesystem local (REGISTRY_ROOT) : cosign
+                                    a besoin de parler le protocole HTTP de
+                                    la registry, pas de lire des fichiers.
+  -i, --image IMAGE                Nom de l'image (voir 'pull --help' pour la
+                                     normalisation automatique en nom long)
+  -t, --tag TAG | -d, --digest DIGEST   Référence à vérifier (exclusifs)
+  -k, --key FICHIER                 Clé publique cosign (cosign.pub). Seule
+                                     la vérification par clé est supportée
+                                     ici (voir la note en tête de fichier).
+
+Options :
+      --no-expand                   Ne pas étendre -i/--image au format long
+  -- ARGS_COSIGN...                 Arguments cosign supplémentaires transmis
+                                     tels quels en fin de ligne (ex: options
+                                     TLS/insecure spécifiques à votre version
+                                     de cosign pour un registre HTTP simple)
+
+Exemple :
+  ${SCRIPT_NAME} verify -u registry.example.com -i alpine -t 3.20 -k cosign.pub
+EOF
+}
+
+cmd_verify() {
+    local registry_url="" image="" tag="" digest="" key="" no_expand="false"
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u|--registry-url) registry_url="$2"; shift 2 ;;
+            -i|--image) image="$2"; shift 2 ;;
+            -t|--tag) tag="$2"; shift 2 ;;
+            -d|--digest) digest="$2"; shift 2 ;;
+            -k|--key) key="$2"; shift 2 ;;
+            --no-expand) no_expand="true"; shift ;;
+            -h|--help) usage_verify; exit 0 ;;
+            --) shift; extra_args=("$@"); break ;;
+            *) echo "Option inconnue pour 'verify' : $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$registry_url" ]] || { echo "Erreur : -u/--registry-url est obligatoire." >&2; usage_verify; exit 1; }
+    [[ -n "$image" ]] || { echo "Erreur : -i/--image est obligatoire." >&2; usage_verify; exit 1; }
+    [[ -n "$key" ]] || { echo "Erreur : -k/--key (clé publique cosign) est obligatoire." >&2; usage_verify; exit 1; }
+    [[ -f "$key" ]] || { echo "Erreur : clé publique introuvable : $key" >&2; exit 1; }
+    if [[ -n "$tag" && -n "$digest" ]]; then
+        echo "Erreur : --tag et --digest sont mutuellement exclusifs." >&2
+        exit 1
+    fi
+    [[ -n "$tag" || -n "$digest" ]] || { echo "Erreur : précisez -t/--tag ou -d/--digest." >&2; usage_verify; exit 1; }
+
+    command -v cosign >/dev/null 2>&1 || { echo "Erreur : 'cosign' est requis pour 'verify'." >&2; exit 1; }
+
+    if [[ "$no_expand" == "false" ]]; then
+        local expanded_image
+        expanded_image="$(normalize_image_name "$image")"
+        if [[ "$expanded_image" != "$image" ]]; then
+            echo "==> Image étendue au format long : ${image} -> ${expanded_image}"
+            image="$expanded_image"
+        fi
+    fi
+
+    local digest_full=""
+    [[ -n "$digest" ]] && digest_full="$(normalize_digest "$digest")"
+
+    local ref
+    if [[ -n "$digest_full" ]]; then
+        ref="${registry_url}/${image}@${digest_full}"
+    else
+        ref="${registry_url}/${image}:${tag}"
+    fi
+
+    echo "==> Vérification de la signature cosign de ${ref} (clé : ${key})..."
+    cosign verify --key "$key" "${extra_args[@]}" "$ref"
+}
+
+# ===========================================================================
+# Commande : sbom
+#
+# Extrait un SBOM (par défaut CycloneDX) attaché à une image sous forme
+# d'attestation in-toto cosign (DSSE), en JSON brut -- le SBOM lui-même, pas
+# l'enveloppe de signature qui l'entoure. Même remarque que 'verify' : la
+# cible est l'URL HTTP où la registry est servie, pas un chemin local.
+# ===========================================================================
+usage_sbom() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} sbom -u REGISTRY_URL -i IMAGE (-t TAG | -d DIGEST) [options] [-- ARGS_COSIGN...]
+
+Options obligatoires :
+  -u, --registry-url HOTE[:PORT]   Hôte de la registry SERVIE en HTTP(S)
+                                     (voir 'verify --help')
+  -i, --image IMAGE
+  -t, --tag TAG | -d, --digest DIGEST   Référence ciblée (exclusifs)
+
+Options :
+  -k, --key FICHIER          Clé publique cosign : si fournie, l'attestation
+                               est VÉRIFIÉE (cosign verify-attestation) avant
+                               extraction. Sans -k, l'attestation est
+                               seulement TÉLÉCHARGÉE SANS AUCUNE VÉRIFICATION
+                               (cosign download attestation) -- à réserver à
+                               l'inspection, pas à un usage de confiance.
+      --type TYPE              Type de prédicat in-toto ciblé (défaut :
+                                 cyclonedx). Voir 'cosign verify-attestation
+                                 --help'/'cosign download attestation --help'
+                                 pour les types reconnus par votre version.
+  -o, --output FICHIER         Fichier de sortie (défaut : stdout)
+      --no-expand                Ne pas étendre -i/--image au format long
+  -- ARGS_COSIGN...              Arguments cosign supplémentaires transmis
+                                  tels quels en fin de ligne
+
+Dépendance supplémentaire : 'jq' est OBLIGATOIRE pour cette commande (pas de
+repli grep/sed : décoder correctement une enveloppe DSSE base64 imbriquée
+sans risquer de corrompre le SBOM nécessite un vrai parseur JSON).
+
+En cas d'attestations multiples du même type pour cette image, seule la
+première est extraite.
+
+Exemple :
+  ${SCRIPT_NAME} sbom -u registry.example.com -i alpine -t 3.20 -k cosign.pub -o alpine-3.20.cdx.json
+EOF
+}
+
+cmd_sbom() {
+    local registry_url="" image="" tag="" digest="" key="" sbom_type="cyclonedx"
+    local output="" no_expand="false"
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u|--registry-url) registry_url="$2"; shift 2 ;;
+            -i|--image) image="$2"; shift 2 ;;
+            -t|--tag) tag="$2"; shift 2 ;;
+            -d|--digest) digest="$2"; shift 2 ;;
+            -k|--key) key="$2"; shift 2 ;;
+            --type) sbom_type="$2"; shift 2 ;;
+            -o|--output) output="$2"; shift 2 ;;
+            --no-expand) no_expand="true"; shift ;;
+            -h|--help) usage_sbom; exit 0 ;;
+            --) shift; extra_args=("$@"); break ;;
+            *) echo "Option inconnue pour 'sbom' : $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$registry_url" ]] || { echo "Erreur : -u/--registry-url est obligatoire." >&2; usage_sbom; exit 1; }
+    [[ -n "$image" ]] || { echo "Erreur : -i/--image est obligatoire." >&2; usage_sbom; exit 1; }
+    if [[ -n "$tag" && -n "$digest" ]]; then
+        echo "Erreur : --tag et --digest sont mutuellement exclusifs." >&2
+        exit 1
+    fi
+    [[ -n "$tag" || -n "$digest" ]] || { echo "Erreur : précisez -t/--tag ou -d/--digest." >&2; usage_sbom; exit 1; }
+
+    command -v cosign >/dev/null 2>&1 || { echo "Erreur : 'cosign' est requis pour 'sbom'." >&2; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "Erreur : 'jq' est requis pour 'sbom' (extraction fiable du SBOM depuis l'enveloppe DSSE)." >&2; exit 1; }
+
+    if [[ -n "$key" ]]; then
+        [[ -f "$key" ]] || { echo "Erreur : clé publique introuvable : $key" >&2; exit 1; }
+    fi
+
+    if [[ "$no_expand" == "false" ]]; then
+        local expanded_image
+        expanded_image="$(normalize_image_name "$image")"
+        if [[ "$expanded_image" != "$image" ]]; then
+            echo "==> Image étendue au format long : ${image} -> ${expanded_image}"
+            image="$expanded_image"
+        fi
+    fi
+
+    local digest_full=""
+    [[ -n "$digest" ]] && digest_full="$(normalize_digest "$digest")"
+
+    local ref
+    if [[ -n "$digest_full" ]]; then
+        ref="${registry_url}/${image}@${digest_full}"
+    else
+        ref="${registry_url}/${image}:${tag}"
+    fi
+
+    local envelope
+    if [[ -n "$key" ]]; then
+        echo "==> Vérification de l'attestation '${sbom_type}' de ${ref} (clé : ${key})..." >&2
+        envelope="$(cosign verify-attestation --key "$key" --type "$sbom_type" "${extra_args[@]}" "$ref")" \
+            || { echo "Erreur : vérification de l'attestation échouée." >&2; exit 1; }
+    else
+        echo "==> Aucune clé fournie : téléchargement SANS VÉRIFICATION de l'attestation '${sbom_type}' de ${ref}..." >&2
+        envelope="$(cosign download attestation --predicate-type "$sbom_type" "${extra_args[@]}" "$ref")" \
+            || { echo "Erreur : téléchargement de l'attestation échoué." >&2; exit 1; }
+    fi
+
+    local sbom_json
+    sbom_json="$(printf '%s\n' "$envelope" \
+        | jq -r 'select(.payloadType == "application/vnd.in-toto+json") | .payload' \
+        | head -n1)"
+    [[ -n "$sbom_json" ]] || {
+        echo "Erreur : aucune enveloppe d'attestation in-toto exploitable dans la réponse de cosign." >&2
+        exit 1
+    }
+    sbom_json="$(printf '%s' "$sbom_json" | base64 -d 2>/dev/null | jq '.predicate')" \
+        || { echo "Erreur : impossible de décoder/parser le contenu de l'attestation." >&2; exit 1; }
+    [[ -n "$sbom_json" && "$sbom_json" != "null" ]] || {
+        echo "Erreur : l'attestation ne contient pas de champ 'predicate' exploitable." >&2
+        exit 1
+    }
+
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$sbom_json" > "$output"
+        echo "==> SBOM écrit dans ${output}"
+    else
+        printf '%s\n' "$sbom_json"
+    fi
+}
+
+# ===========================================================================
 # Commande : completion
 # ===========================================================================
 # Affiche le script d'auto-complétion bash. Embarqué directement ici pour
@@ -1347,7 +1790,7 @@ cmd_completion() {
 #   registry-cli.sh completion > ~/.local/share/bash-completion/completions/registry-cli
 #
 
-_registry_cli_commands="pull upload list remove index completion"
+_registry_cli_commands="pull upload list remove index verify sbom completion"
 
 _registry_cli_find_opt_value() {
     local opt_list="$1" opt i
@@ -1438,7 +1881,7 @@ _registry_cli_complete() {
     local opts=""
     case "$cmd" in
         pull)
-            opts="-i --image -t --tag -d --digest -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir -h --help"
+            opts="-i --image -t --tag -d --digest -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
             ;;
         upload)
             opts="-a --archive -r --registry-root --regen-config --no-regen-config --require-signature --skip-checksum --gpg-keyring -h --help"
@@ -1451,6 +1894,12 @@ _registry_cli_complete() {
             ;;
         index)
             opts="-r --registry-root -h --help"
+            ;;
+        verify)
+            opts="-u --registry-url -i --image -t --tag -d --digest -k --key --no-expand -h --help"
+            ;;
+        sbom)
+            opts="-u --registry-url -i --image -t --tag -d --digest -k --key --type -o --output --no-expand -h --help"
             ;;
         *)
             opts="-h --help"
@@ -1494,6 +1943,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         list) cmd_list "$@" ;;
         remove) cmd_remove "$@" ;;
         index) cmd_index "$@" ;;
+        verify) cmd_verify "$@" ;;
+        sbom) cmd_sbom "$@" ;;
         completion) cmd_completion "$@" ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Commande inconnue : $COMMAND" >&2; usage; exit 1 ;;
