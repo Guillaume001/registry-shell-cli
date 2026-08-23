@@ -231,11 +231,14 @@ registry-cli.sh list -r REGISTRY_ROOT [--json]
 
 Affiche, pour chaque image/tag : image, tag, digest, présence
 signature/attestation/SBOM cosign (colonne `COSIGN`, ex: `sig,att`), nombre
-de blobs, taille du manifeste, date de dernière modification. Les tags
-compagnons cosign eux-mêmes (`sha256-<digest>.sig`/`.att`/`.sbom`, tag de
-repli `sha256-<digest>`) ne sont **jamais** listés comme des tags à part :
-ils sont rattachés au vrai tag qu'ils concernent. En JSON, trois champs
-booléens `signature`/`attestation`/`sbom` remplacent cette colonne.
+de blobs, taille du manifeste, date de dernière modification. Les artefacts
+cosign eux-mêmes — tags compagnons (`sha256-<digest>.sig`/`.att`/`.sbom`,
+tag de repli `sha256-<digest>`), **et leurs éventuelles copies canoniques
+`manifests/sha256:xxx`**, y compris pour chaque entrée référencée par le
+repli "referrers" — ne sont **jamais** listés comme des images ou tags à
+part : ils sont rattachés au vrai tag/image qu'ils concernent, déjà
+signalés par la colonne `COSIGN`. En JSON, trois champs booléens
+`signature`/`attestation`/`sbom` remplacent cette colonne.
 
 ```bash
 registry-cli.sh list -r /srv/registrish

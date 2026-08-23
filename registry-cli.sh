@@ -203,18 +203,30 @@ is_cosign_companion_tag() {
 # "whitespace IFS" et supprime un premier champ vide avant de découper,
 # faisant glisser le CHEMIN_FICHIER dans la variable NOM_TAG côté
 # consommateur ; un marqueur non-vide évite ce piège classique de bash.
+#
+# Un artefact cosign compagnon (tag ou canonique) n'est JAMAIS affiché comme
+# entrée à part : on sait déjà, via ses badges sur le vrai tag concerné
+# (voir cmd_list/regen_index_html), qu'il existe. Ceci vaut aussi bien pour
+# son fichier de tag compagnon (sha256-<digest>.sig/.att/.sbom, ou le tag de
+# repli referrers sha256-<digest>) que pour SA PROPRE copie canonique
+# manifests/sha256:<digest-de-son-contenu> -- sans quoi cette dernière
+# réapparaîtrait comme une fausse image "(sans tag)".
 # ---------------------------------------------------------------------------
 NO_TAG_MARKER="<sans-tag>"
 
 list_manifest_entries() {
     local manifest_dir="$1"
-    local -A tagged_digests=()
+    local -A tagged_digests=()   # digest déjà affiché comme entrée (tag réel ou image sans tag)
+    local -A hidden_digests=()   # digest d'un artefact cosign compagnon -> jamais affiché
     local f base d
 
     while IFS= read -r f; do
         base="$(basename "$f")"
-        is_cosign_companion_tag "$base" && continue
         d="$(sha256sum "$f" | cut -d' ' -f1)"
+        if is_cosign_companion_tag "$base"; then
+            hidden_digests["$d"]=1
+            continue
+        fi
         tagged_digests["$d"]=1
         printf '%s\t%s\n' "$base" "$f"
     done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' 2>/dev/null | sort)
@@ -223,6 +235,7 @@ list_manifest_entries() {
         base="$(basename "$f")"
         d="${base#sha256:}"
         [[ -n "${tagged_digests[$d]:-}" ]] && continue
+        [[ -n "${hidden_digests[$d]:-}" ]] && continue
         printf '%s\t%s\n' "$NO_TAG_MARKER" "$f"
     done < <(find "$manifest_dir" -maxdepth 1 -type f -name 'sha256:*' 2>/dev/null | sort)
 }
@@ -332,7 +345,12 @@ pull_oci_referrers_fallback() {
     skopeo copy "${source_ref}:${referrers_tag}" "dir:${referrers_dir}" \
         >"${referrers_dir}.log" 2>&1 || return 1
 
-    convert_skopeo_dir_to_v2 "$referrers_dir" "$image" "" "$v2_root"
+    # Tag "compagnon" (forme nue sha256-<digest>, reconnue par
+    # is_cosign_companion_tag) plutôt que tag="" : sans ça, ce manifeste
+    # n'existerait que sous son nom canonique manifests/sha256:xxx, exactement
+    # comme une image récupérée par digest seul -- et réapparaîtrait donc à
+    # tort comme une fausse image "(sans tag)" dans 'list'/'index'.
+    convert_skopeo_dir_to_v2 "$referrers_dir" "$image" "$referrers_tag" "$v2_root"
 
     local d n=0 referrer_dir
     while IFS= read -r d; do
@@ -342,7 +360,7 @@ pull_oci_referrers_fallback() {
         mkdir -p "$referrer_dir"
         if skopeo copy "${source_ref}@sha256:${d}" "dir:${referrer_dir}" \
             >"${referrer_dir}.log" 2>&1; then
-            convert_skopeo_dir_to_v2 "$referrer_dir" "$image" "" "$v2_root"
+            convert_skopeo_dir_to_v2 "$referrer_dir" "$image" "sha256-${d}" "$v2_root"
         fi
     done < <(extract_referenced_digests "${referrers_dir}/manifest.json")
     return 0
