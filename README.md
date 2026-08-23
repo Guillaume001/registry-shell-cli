@@ -22,7 +22,10 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
   - [list](#list--inventaire-de-la-registry)
   - [remove](#remove--supprimer-un-tag-un-digest-ou-une-image)
   - [index](#index--page-daccueil-html-de-la-registry)
+  - [verify](#verify--vérifier-une-signature-cosign)
+  - [sbom](#sbom--extraire-un-sbom-cyclonedx)
   - [completion](#auto-complétion)
+- [Signatures et SBOM (cosign)](#signatures-et-sbom-cosign)
 - [Format de l'archive](#format-de-larchive)
 - [Structure de la registry produite](#structure-de-la-registry-produite)
 - [Workflows type](#workflows-type)
@@ -37,8 +40,10 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
 | `skopeo`    | `pull` sans `--from-dir`                                   | non si `--from-dir` utilisé     |
 | `gpg`       | signer (`pull -k`) ou vérifier une signature (`upload`)    | non si pas de signature en jeu  |
 | `rsync`     | `upload` (fusion des fichiers)                              | non — repli automatique sur `cp -a` |
-| `jq`        | `upload`/`remove` (lecture du `mediaType` des manifestes)   | non — repli automatique par `grep`/`sed` |
+| `jq`        | `upload`/`remove` (lecture du `mediaType` des manifestes)   | non — repli automatique par `grep`/`sed` (sauf `sbom`, voir ci-dessous) |
 | `column`    | `list` (affichage en tableau aligné)                        | non — repli par `awk`           |
+| `cosign`    | `verify`, `sbom`                                             | **oui**, pas de repli — ces commandes parlent directement le protocole cosign |
+| `jq` (pour `sbom`) | `sbom` (décodage de l'enveloppe DSSE base64 imbriquée) | **oui pour `sbom` uniquement**, pas de repli grep/sed (risque de corrompre le SBOM) |
 
 Aucune de ces dépendances optionnelles ne bloque le script si elle est
 absente : un repli en bash pur est utilisé automatiquement, avec un message
@@ -116,6 +121,16 @@ programme nommé `registry-cli.sh`, `registry-cli`, ou `./registry-cli.sh`.
   Désactivable avec `--no-expand` sur `pull`. `remove --image` recherche
   d'abord le nom tel quel, puis son équivalent étendu si introuvable — donc
   `remove --image alpine` retrouve `docker.io/library/alpine`.
+- **Artefact cosign (signature/attestation/SBOM)** : cosign ne stocke pas
+  ces objets ailleurs que dans le même dépôt que l'image, sous forme de
+  **tags supplémentaires ordinaires** : `sha256-<digest>.sig` (signature),
+  `sha256-<digest>.att` (attestation in-toto, peut embarquer un SBOM
+  CycloneDX), `sha256-<digest>.sbom` (SBOM legacy), ou le tag de repli
+  statique OCI 1.1 `sha256-<digest>` (index listant les manifestes qui
+  référencent l'image, utilisé quand la registry ne supporte pas l'API
+  Referrers dynamique — le cas ici, Apache2 ne servant que du statique).
+  Comme ce sont de simples tags, ils transitent par le même mécanisme que
+  n'importe quel autre tag (voir [pull --with-signatures](#signatures-et-sbom-cosign)).
 
 ## Commandes
 
@@ -138,6 +153,8 @@ registry-cli.sh pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-di
 | `--arch ARCH` | Architecture à télécharger (`amd64`, `arm64`, `arm`, `386`, `ppc64le`, `s390x`...). **Défaut : `amd64`** (une seule plateforme). `--arch all` récupère toutes les plateformes disponibles (manifest-list multi-arch). |
 | `--os OS` | Système d'exploitation, utilisé avec `--arch` (hors `all`). Défaut : `linux`. |
 | `--keep-workdir` | Conserve le répertoire de travail temporaire (debug). |
+| `--with-signatures` | Recherche et embarque, en plus de l'image, les artefacts cosign associés : signature, attestation, SBOM legacy, et le repli statique OCI 1.1 "referrers". Voir [Signatures et SBOM (cosign)](#signatures-et-sbom-cosign). Nécessite `skopeo`. |
+| `--sig-from-dir DIR` / `--att-from-dir DIR` / `--sbom-from-dir DIR` | Équivalents 100% offline, artefact par artefact : `DIR` est un répertoire `skopeo dir:` déjà produit pour le tag compagnon correspondant. |
 
 **Exemples :**
 
@@ -163,6 +180,9 @@ skopeo copy --override-arch amd64 --override-os linux \
 
 # Poste air-gapped : transférez /tmp/skopeo-alpine, puis
 registry-cli.sh pull -i alpine -t 3.20 --from-dir /tmp/skopeo-alpine
+
+registry-cli.sh pull -i alpine -t 3.20 --with-signatures
+#   embarque en plus la signature/attestation/SBOM cosign si présentes
 ```
 
 ### `upload` — placer une archive dans la registry
@@ -206,12 +226,17 @@ registry-cli.sh list -r REGISTRY_ROOT [--json]
 | `-r`, `--registry-root DIR` | **Obligatoire.** |
 | `--json` | Sortie JSON au lieu d'un tableau texte. |
 
-Affiche, pour chaque image/tag : image, tag, digest, nombre de blobs, taille
-du manifeste, date de dernière modification.
+Affiche, pour chaque image/tag : image, tag, digest, présence
+signature/attestation/SBOM cosign (colonne `COSIGN`, ex: `sig,att`), nombre
+de blobs, taille du manifeste, date de dernière modification. Les tags
+compagnons cosign eux-mêmes (`sha256-<digest>.sig`/`.att`/`.sbom`, tag de
+repli `sha256-<digest>`) ne sont **jamais** listés comme des tags à part :
+ils sont rattachés au vrai tag qu'ils concernent. En JSON, trois champs
+booléens `signature`/`attestation`/`sbom` remplacent cette colonne.
 
 ```bash
 registry-cli.sh list -r /srv/registrish
-registry-cli.sh list -r /srv/registrish --json | jq '.[] | .image'
+registry-cli.sh list -r /srv/registrish --json | jq '.[] | select(.signature) | .image'
 ```
 
 ### `remove` — supprimer un tag, un digest, ou une image
@@ -283,6 +308,95 @@ registry existante qui n'en a pas encore).
 registry-cli.sh index -r /srv/registrish
 # puis ouvrir /srv/registrish/index.html dans un navigateur,
 # ou le servir via le même Apache2 que la registry elle-même.
+```
+
+La page affiche aussi des badges 🔏 signé / 📎 attesté / 📄 SBOM pour chaque
+tag concerné.
+
+### `verify` — vérifier une signature cosign
+
+```
+registry-cli.sh verify -u REGISTRY_URL -i IMAGE (-t TAG | -d DIGEST) -k CLE_PUBLIQUE [options] [-- ARGS_COSIGN...]
+```
+
+**Différence importante avec toutes les autres commandes** : `verify` (et
+`sbom`) ne touchent **jamais** un chemin local. cosign parle le protocole
+HTTP "OCI Distribution", donc `REGISTRY_URL` doit être l'hôte où `v2/` est
+réellement **servi** (ex: `registry.example.com`, `localhost:8080`) — pas
+`REGISTRY_ROOT`.
+
+| Option | Description |
+|---|---|
+| `-u`, `--registry-url HOTE[:PORT]` | **Obligatoire.** Hôte de la registry servie en HTTP(S). |
+| `-i`, `--image IMAGE` | **Obligatoire.** |
+| `-t`, `--tag TAG` / `-d`, `--digest DIGEST` | Référence à vérifier (mutuellement exclusifs). |
+| `-k`, `--key FICHIER` | **Obligatoire.** Clé publique cosign (`cosign.pub`). Seule la vérification **par clé** est supportée (pas de mode "keyless" Rekor/Fulcio, qui nécessiterait un accès réseau à la transparence Sigstore publique au moment de la vérification — incompatible avec l'usage 100% offline de cet outil). |
+| `--no-expand` | Ne pas étendre `-i`/`--image` au format long. |
+| `-- ARGS_COSIGN...` | Arguments cosign supplémentaires transmis tels quels (ex: options spécifiques à votre version de cosign pour un registre HTTP sans TLS). |
+
+```bash
+registry-cli.sh verify -u registry.example.com -i alpine -t 3.20 -k cosign.pub
+```
+
+### `sbom` — extraire un SBOM CycloneDX
+
+```
+registry-cli.sh sbom -u REGISTRY_URL -i IMAGE (-t TAG | -d DIGEST) [options] [-- ARGS_COSIGN...]
+```
+
+Extrait le SBOM (CycloneDX par défaut) attaché en tant qu'attestation
+in-toto cosign, en JSON **brut** — le SBOM lui-même, pas l'enveloppe DSSE
+qui le signe. Même remarque que `verify` : `REGISTRY_URL` cible la registry
+servie en HTTP, pas un chemin local.
+
+| Option | Description |
+|---|---|
+| `-u`, `--registry-url HOTE[:PORT]` | **Obligatoire.** |
+| `-i`, `--image IMAGE` | **Obligatoire.** |
+| `-t`, `--tag TAG` / `-d`, `--digest DIGEST` | Référence ciblée (mutuellement exclusifs). |
+| `-k`, `--key FICHIER` | Si fournie, l'attestation est **vérifiée** (`cosign verify-attestation`) avant extraction. **Sans `-k`**, elle est seulement **téléchargée sans aucune vérification** (`cosign download attestation`) — à réserver à l'inspection, pas à un usage de confiance. |
+| `--type TYPE` | Type de prédicat in-toto ciblé. Défaut : `cyclonedx`. |
+| `-o`, `--output FICHIER` | Fichier de sortie. Défaut : stdout. |
+| `--no-expand` | Ne pas étendre `-i`/`--image` au format long. |
+| `-- ARGS_COSIGN...` | Arguments cosign supplémentaires transmis tels quels. |
+
+En cas d'attestations multiples du même type pour une image, seule la
+première est extraite.
+
+```bash
+registry-cli.sh sbom -u registry.example.com -i alpine -t 3.20 \
+    -k cosign.pub -o alpine-3.20.cdx.json
+```
+
+## Signatures et SBOM (cosign)
+
+`pull --with-signatures` (ou `--sig-from-dir`/`--att-from-dir`/`--sbom-from-dir`
+pour un usage 100% offline) télécharge et conserve les artefacts
+[cosign](https://github.com/sigstore/cosign) associés à une image — au même
+titre que n'importe quel autre tag de la registry, puisque c'est exactement
+ce qu'ils sont (voir [Concepts](#concepts)). `upload`, `list` et `index`
+les portent déjà nativement : aucun changement de leur part n'était
+nécessaire, seule leur énumération des tags a été ajustée pour ne pas les
+afficher comme de faux tags d'image.
+
+`verify` et `sbom`, en revanche, sont des commandes véritablement à part :
+elles ne lisent **aucun fichier local**, elles parlent le protocole HTTP
+"OCI Distribution" via `cosign`, donc elles ciblent l'URL où la registry est
+**servie** (Apache2) — typiquement la même registry après un `upload`, mais
+ça pourrait tout aussi bien être la registry source d'origine.
+
+**Flux typique de bout en bout :**
+
+```bash
+# 1. Récupérer l'image + ses artefacts cosign (poste connecté)
+registry-cli.sh pull -i alpine -t 3.20 --with-signatures -o alpine.tar.gz
+
+# 2. Déployer (poste avec accès à la registry cible, éventuellement air-gapped)
+registry-cli.sh upload -a alpine.tar.gz -r /srv/registrish
+
+# 3. Vérifier après déploiement, contre la registry telle que servie
+registry-cli.sh verify -u registry.example.com -i alpine -t 3.20 -k cosign.pub
+registry-cli.sh sbom -u registry.example.com -i alpine -t 3.20 -k cosign.pub
 ```
 
 ## Format de l'archive
@@ -365,6 +479,28 @@ registry-cli.sh remove -r /srv/registrish --image alpine --tag 3.19   # ancienne
   un usage en production.
 - **Backend Apache2 uniquement** : la génération de configuration ne
   couvre que Apache2 (`.htaccess` + `mod_headers`), pas NGINX/Netlify/S3.
+- **Support cosign non testé contre un vrai `cosign`/`skopeo`** : ni l'un
+  ni l'autre binaire n'était disponible dans l'environnement de
+  développement (pas d'accès réseau pour les installer). La logique de
+  détection/conservation des artefacts (`is_cosign_companion_tag`,
+  `convert_skopeo_dir_to_v2` appliqué aux tags `.sig`/`.att`/`.sbom`/
+  `sha256-<digest>`) et l'extraction JSON de `sbom` (décodage DSSE
+  base64 → `predicate`) sont couvertes par des tests utilisant de faux
+  binaires `skopeo`/`cosign` reproduisant fidèlement leur interface en
+  ligne de commande — mais jamais vérifiées contre les vrais outils.
+  Testez une première fois sur une image réellement signée avant un usage
+  en production.
+- **Convention cosign supposée** : `pull --with-signatures` suppose la
+  convention "tag-based" historique (`sha256-<digest>.sig`/`.att`/`.sbom`)
+  et le repli statique OCI 1.1 "referrers" (`sha256-<digest>`, avec
+  récupération récursive d'un niveau des manifestes qu'il référence). Si
+  votre registry source pousse les signatures autrement (API Referrers
+  dynamique sans tag de repli, par exemple), elles ne seront pas trouvées.
+- **`verify`/`sbom` nécessitent un registre HTTP réellement accessible** :
+  contrairement au reste de l'outil, ces deux commandes ne sont pas
+  offline — `cosign` doit pouvoir joindre `REGISTRY_URL` en HTTP(S) au
+  moment de l'appel. Un registre HTTP sans TLS peut nécessiter des options
+  cosign spécifiques selon votre version (voir `-- ARGS_COSIGN...`).
 
 ## Tests
 
@@ -390,7 +526,13 @@ Elle couvre :
   (`get_manifest_platforms`, `regen_index_html`) ;
 - les sous-commandes `pull`, `upload`, `list`, `remove` (dont le GC) et
   `index`, testées bout-en-bout via des appels réels au script
-  (sans dépendre de `skopeo`, grâce à `--from-dir`).
+  (sans dépendre de `skopeo`, grâce à `--from-dir`) ;
+- les artefacts cosign (`tests/cosign.bats`) : filtrage des tags compagnons
+  et badges dans `list`/`index`, `pull --with-signatures`/`--*-from-dir`
+  (avec un faux binaire `skopeo` reproduisant son interface en ligne de
+  commande, y compris le repli "referrers" OCI 1.1), et `verify`/`sbom`
+  (avec un faux binaire `cosign`, pour exercer le décodage réel de
+  l'enveloppe DSSE par `jq` dans `sbom`).
 
 Le script peut être `source`-é sans déclencher l'exécution d'une commande
 (le point d'entrée est protégé par `[[ "${BASH_SOURCE[0]}" == "${0}" ]]`),
