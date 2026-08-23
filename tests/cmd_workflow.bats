@@ -185,3 +185,55 @@ setup() {
     [[ "$output" == *"_registry_cli_complete"* ]]
     [[ "$output" == *"complete -F _registry_cli_complete registry-cli.sh"* ]]
 }
+
+# --- Régression : pull par digest seul (sans -t) doit rester visible ------
+# Bug signalé : une image récupérée avec 'pull -d sha256:... ' (sans -t,
+# cas d'usage documenté et supporté) n'apparaissait ni dans 'list' ni dans
+# 'index.html' après 'upload', bien que ses blobs/manifest soient bien
+# présents sur disque -- seul le fichier manifests/sha256:xxx canonique
+# existe (pas de fichier de tag), et il était exclu à tort de l'énumération.
+
+@test "pull -d sans -t, puis upload : l'image apparaît dans list (texte)" {
+    cd "$BATS_TEST_TMPDIR"
+    build_skopeo_dir "skopeo-src-digest" > /dev/null
+    local digest_hex
+    digest_hex="$(sha256sum skopeo-src-digest/manifest.json | cut -d' ' -f1)"
+    "$REGISTRY_CLI" pull -i registry.access.redhat.com/ubi10 -d "sha256:${digest_hex}" \
+        --from-dir skopeo-src-digest -o digest-only.tar.gz --no-expand >/dev/null
+
+    "$REGISTRY_CLI" upload -a digest-only.tar.gz -r "$REGISTRY_ROOT" >/dev/null
+
+    run "$REGISTRY_CLI" list -r "$REGISTRY_ROOT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"registry.access.redhat.com/ubi10"* ]]
+    [[ "$output" == *"${digest_hex}"* ]]
+    [[ "$output" != *"Aucune image trouvée"* ]]
+}
+
+@test "pull -d sans -t, puis upload : l'image apparaît dans list --json avec tag vide" {
+    cd "$BATS_TEST_TMPDIR"
+    build_skopeo_dir "skopeo-src-digest" > /dev/null
+    local digest_hex
+    digest_hex="$(sha256sum skopeo-src-digest/manifest.json | cut -d' ' -f1)"
+    "$REGISTRY_CLI" pull -i registry.access.redhat.com/ubi10 -d "sha256:${digest_hex}" \
+        --from-dir skopeo-src-digest -o digest-only.tar.gz --no-expand >/dev/null
+
+    "$REGISTRY_CLI" upload -a digest-only.tar.gz -r "$REGISTRY_ROOT" --no-regen-config >/dev/null
+
+    run "$REGISTRY_CLI" list -r "$REGISTRY_ROOT" --json
+    [ "$status" -eq 0 ]
+    echo "$output" | jq -e --arg d "sha256:${digest_hex}" \
+        '.[] | select(.image == "registry.access.redhat.com/ubi10") | .tag == "" and .digest == $d' \
+        | grep -q true
+}
+
+@test "pull -d sans -t, puis upload : l'image apparaît dans index.html" {
+    cd "$BATS_TEST_TMPDIR"
+    build_skopeo_dir "skopeo-src-digest" > /dev/null
+    "$REGISTRY_CLI" pull -i registry.access.redhat.com/ubi10 -d "sha256:$(sha256sum skopeo-src-digest/manifest.json | cut -d' ' -f1)" \
+        --from-dir skopeo-src-digest -o digest-only.tar.gz --no-expand >/dev/null
+
+    "$REGISTRY_CLI" upload -a digest-only.tar.gz -r "$REGISTRY_ROOT" >/dev/null
+
+    grep -q '"image":"registry.access.redhat.com/ubi10","tag":""' "${REGISTRY_ROOT}/index.html"
+}

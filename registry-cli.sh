@@ -182,6 +182,51 @@ is_cosign_companion_tag() {
     [[ "$1" =~ ^sha256-[0-9a-f]{64}(\.sig|\.att|\.sbom)?$ ]]
 }
 
+# ---------------------------------------------------------------------------
+# Utilitaire partagé par 'list' et 'index' : énumère les entrées à afficher
+# pour un répertoire manifests/ donné.
+#
+# Cas normal : chaque VRAI tag (n'importe quel nom de fichier, hors
+# manifeste canonique manifests/sha256:xxx, hors artefact cosign compagnon).
+#
+# Cas particulier géré ici : une image récupérée par digest SEUL (ex:
+# 'pull -d sha256:... ' sans '-t') n'a AUCUN fichier de tag -- seulement son
+# manifests/sha256:xxx canonique. Sans traitement particulier, un tel
+# manifeste est invisible dans 'list'/'index' (le sha256:xxx canonique est
+# volontairement exclu quand un tag existe déjà, pour ne pas lister deux
+# fois la même image). On le fait donc apparaître ici avec un nom de tag
+# vide dès lors qu'aucun tag existant ne pointe déjà vers ce même digest.
+#
+# Sortie : une ligne "NOM_TAG<TAB>CHEMIN_FICHIER" par entrée. NOM_TAG vaut
+# le marqueur NO_TAG_MARKER (jamais un champ vide) pour une entrée sans tag
+# -- "IFS=$'\t' read -r a b" traite la tabulation comme un caractère
+# "whitespace IFS" et supprime un premier champ vide avant de découper,
+# faisant glisser le CHEMIN_FICHIER dans la variable NOM_TAG côté
+# consommateur ; un marqueur non-vide évite ce piège classique de bash.
+# ---------------------------------------------------------------------------
+NO_TAG_MARKER="<sans-tag>"
+
+list_manifest_entries() {
+    local manifest_dir="$1"
+    local -A tagged_digests=()
+    local f base d
+
+    while IFS= read -r f; do
+        base="$(basename "$f")"
+        is_cosign_companion_tag "$base" && continue
+        d="$(sha256sum "$f" | cut -d' ' -f1)"
+        tagged_digests["$d"]=1
+        printf '%s\t%s\n' "$base" "$f"
+    done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' 2>/dev/null | sort)
+
+    while IFS= read -r f; do
+        base="$(basename "$f")"
+        d="${base#sha256:}"
+        [[ -n "${tagged_digests[$d]:-}" ]] && continue
+        printf '%s\t%s\n' "$NO_TAG_MARKER" "$f"
+    done < <(find "$manifest_dir" -maxdepth 1 -type f -name 'sha256:*' 2>/dev/null | sort)
+}
+
 # ===========================================================================
 # Conversion "skopeo dir:" -> arborescence registry v2/<image>/{blobs,manifests}
 #
@@ -453,10 +498,8 @@ regen_index_html() {
         blob_count=0
         [[ -d "$blobs_dir" ]] && blob_count=$(find "$blobs_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
 
-        while IFS= read -r tag_file; do
-            tag_name="$(basename "$tag_file")"
-            [[ "$tag_name" == sha256:* ]] && continue
-            is_cosign_companion_tag "$tag_name" && continue
+        while IFS=$'\t' read -r tag_name tag_file; do
+            [[ "$tag_name" == "$NO_TAG_MARKER" ]] && tag_name=""
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
             digest_hex="${digest#sha256:}"
             size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo 0)"
@@ -469,7 +512,7 @@ regen_index_html() {
                 "$(escape_json_string "$image_name")" "$(escape_json_string "$tag_name")" \
                 "$digest" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
                 "$has_sig" "$has_att" "$has_sbom")")
-        done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' 2>/dev/null | sort)
+        done < <(list_manifest_entries "$manifest_dir")
     done < <(find "${root}/v2" -type d -name manifests 2>/dev/null | sort)
 
     local json_array
@@ -627,7 +670,7 @@ function render() {
 
         tr.innerHTML = `
             <td class="image-name">${r.image}</td>
-            <td><span class="tag">${r.tag}</span></td>
+            <td><span class="tag">${r.tag || "(sans tag)"}</span></td>
             <td>${platformBadges || '<span class="badge">unknown</span>'}</td>
             <td class="digest" title="${r.digest} (cliquer pour copier)" data-digest="${r.digest}">${shortDigest(r.digest)}</td>
             <td>${cosignBadges}</td>
@@ -1160,10 +1203,8 @@ cmd_list() {
         blob_count=0
         [[ -d "$blobs_dir" ]] && blob_count=$(find "$blobs_dir" -type f | wc -l | tr -d ' ')
 
-        while IFS= read -r tag_file; do
-            tag_name="$(basename "$tag_file")"
-            [[ "$tag_name" == sha256:* ]] && continue
-            is_cosign_companion_tag "$tag_name" && continue
+        while IFS=$'\t' read -r tag_name tag_file; do
+            [[ "$tag_name" == "$NO_TAG_MARKER" ]] && tag_name=""
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
             digest_hex="${digest#sha256:}"
             size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo "?")"
@@ -1177,7 +1218,7 @@ cmd_list() {
             [[ "$has_sbom" == "true" ]] && cosign_summary="${cosign_summary:+${cosign_summary},}sbom"
             [[ -z "$cosign_summary" ]] && cosign_summary="-"
             rows+=("${image_name}|${tag_name}|${digest}|${cosign_summary}|${has_sig}|${has_att}|${has_sbom}|${blob_count}|${size}|${mtime}")
-        done < <(find "$manifest_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' | sort)
+        done < <(list_manifest_entries "$manifest_dir")
     done < <(find "${root}/v2" -type d -name manifests | sort)
 
     if [[ "${#rows[@]}" -eq 0 ]]; then
@@ -1202,6 +1243,7 @@ cmd_list() {
             printf 'IMAGE\tTAG\tDIGEST\tCOSIGN\tBLOBS\tMANIFEST_SIZE\tLAST_MODIFIED\n'
             for row in "${rows[@]}"; do
                 IFS='|' read -r image tag digest cosign_summary has_sig has_att has_sbom blobs size mtime <<< "$row"
+                [[ -z "$tag" ]] && tag="(sans tag)"
                 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$image" "$tag" "$digest" "$cosign_summary" "$blobs" "$size" "$mtime"
             done
         } | if command -v column >/dev/null 2>&1; then
