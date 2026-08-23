@@ -9,6 +9,52 @@ setup() {
     ROOT="${BATS_TEST_TMPDIR}/registry"
 }
 
+# --- list_manifest_entries ------------------------------------------------
+# Régression : une image récupérée par digest seul ('pull -d ... ' sans
+# '-t') n'a qu'un manifests/sha256:xxx canonique, aucun fichier de tag.
+# Elle doit rester visible dans 'list'/'index' (avec un "tag" vide), au lieu
+# d'être totalement invisible.
+
+@test "list_manifest_entries: image taguée normalement -> une seule entrée, sous son nom de tag" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    run list_manifest_entries "${ROOT}/v2/myimage/manifests"
+    [ "$status" -eq 0 ]
+    local n
+    n="$(echo "$output" | wc -l)"
+    [ "$n" -eq 1 ]
+    [[ "$output" == "3.20"$'\t'*"/manifests/3.20" ]]
+}
+
+@test "list_manifest_entries: image récupérée par digest seul (pas de fichier de tag) -> une entrée marquée NO_TAG_MARKER" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    # tag="" : reproduit 'pull -d sha256:... ' sans '-t' -> pas de fichier de
+    # tag écrit, seulement manifests/sha256:xxx (voir convert_skopeo_dir_to_v2).
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "" "${ROOT}/v2"
+
+    run list_manifest_entries "${ROOT}/v2/myimage/manifests"
+    [ "$status" -eq 0 ]
+    local n
+    n="$(echo "$output" | wc -l)"
+    [ "$n" -eq 1 ]
+    [[ "$output" == "${NO_TAG_MARKER}"$'\t'*"/manifests/sha256:"* ]]
+}
+
+@test "list_manifest_entries: n'affiche jamais deux fois la même image (tag + canonique)" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    run list_manifest_entries "${ROOT}/v2/myimage/manifests"
+    [ "$status" -eq 0 ]
+    local n
+    n="$(echo "$output" | wc -l)"
+    [ "$n" -eq 1 ]
+}
+
 @test "get_manifest_platforms: manifeste simple -> lit architecture/os du blob de config" {
     local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
     build_skopeo_dir "$skopeo_dir" > /dev/null

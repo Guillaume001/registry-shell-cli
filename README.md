@@ -110,6 +110,9 @@ programme nommé `registry-cli.sh`, `registry-cli`, ou `./registry-cli.sh`.
   fichier canonique `manifests/sha256:<digest>` est une copie du même
   contenu, nommée par son digest. Les deux coexistent et sont décorrélés :
   supprimer l'un ne supprime pas l'autre (voir [remove](#remove--supprimer-un-tag-un-digest-ou-une-image)).
+  Une image récupérée avec `pull -d ...` **sans** `-t` n'a que le fichier
+  canonique, aucun tag : `list`/`index` l'affichent quand même, avec un tag
+  vide (`(sans tag)` en texte, `""` en JSON).
 - **Nom d'image long (canonique)** : `pull` étend automatiquement un nom
   court/ambigu vers son nom long, pour toujours savoir sans ambiguïté d'où
   vient l'image (mêmes règles que Docker/Podman en interne) :
