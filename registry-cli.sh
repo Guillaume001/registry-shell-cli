@@ -556,73 +556,132 @@ regen_index_html() {
 <title>Registry — Images disponibles</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #161922; --border: #262b36;
-    --text: #e6e8ec; --text-dim: #9aa1ae; --accent: #5b9dff; --good: #5bd97e;
+    --bg: #0b0d12; --panel: #12151c; --panel-alt: #171b24; --border: #262b36; --border-soft: #1d2129;
+    --text: #e6e8ec; --text-dim: #9aa1ae; --text-faint: #6b7280;
+    --accent: #5b9dff; --accent-dim: rgba(91,157,255,.14);
+    --good: #5bd97e; --good-dim: rgba(91,217,126,.13);
     --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+    --radius: 12px;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding: 2rem;
+    background:
+      radial-gradient(1200px 480px at 15% -10%, rgba(91,157,255,.08), transparent 60%),
+      var(--bg);
+    color: var(--text); padding: 2.5rem clamp(1rem, 4vw, 3rem) 4rem;
+    -webkit-font-smoothing: antialiased;
   }
-  header { margin-bottom: 1.5rem; }
-  h1 { font-size: 1.4rem; margin: 0 0 .3rem; display:flex; align-items:center; gap:.5rem; }
+  .page { max-width: 1180px; margin: 0 auto; }
+  header { margin-bottom: 1.75rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .35rem; display:flex; align-items:center; gap:.55rem; font-weight: 700; letter-spacing: -.01em; }
   .subtitle { color: var(--text-dim); font-size: .85rem; }
-  .controls { margin: 1.25rem 0; display:flex; gap: .75rem; align-items:center; flex-wrap:wrap; }
-  input[type="search"] {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    padding: .55rem .8rem; border-radius: 8px; font-size: .9rem; min-width: 280px; outline: none;
+
+  .stats-bar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: .75rem; margin: 1.5rem 0;
   }
-  input[type="search"]:focus { border-color: var(--accent); }
-  .stat { color: var(--text-dim); font-size: .82rem; }
-  .table-wrap { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-  table { width: 100%; border-collapse: collapse; background: var(--panel); }
-  th, td { text-align:left; padding: .6rem .9rem; border-bottom: 1px solid var(--border); font-size: .85rem; white-space: nowrap; }
-  th { color: var(--text-dim); font-weight:600; cursor:pointer; user-select:none; font-size:.78rem; text-transform:uppercase; letter-spacing:.03em; }
-  th:hover { color: var(--text); }
-  tr:last-child td { border-bottom:none; }
-  tbody tr:hover td { background: rgba(255,255,255,.03); }
-  .image-name { font-weight:600; }
-  .tag { font-family: var(--mono); background: rgba(91,157,255,.14); color: var(--accent); padding:.15rem .5rem; border-radius:6px; font-size:.78rem; }
+  .stat-tile {
+    background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
+    padding: .85rem 1rem;
+  }
+  .stat-value { font-size: 1.35rem; font-weight: 700; line-height: 1.1; }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.good { color: var(--good); }
+  .stat-label { color: var(--text-dim); font-size: .74rem; margin-top: .2rem; text-transform: uppercase; letter-spacing: .04em; }
+
+  .controls {
+    margin: 1.5rem 0 1.25rem; display:flex; gap: .6rem; align-items:center; flex-wrap:wrap;
+    position: sticky; top: 0; padding: .6rem 0; background: linear-gradient(var(--bg) 78%, transparent); z-index: 5;
+  }
+  input[type="search"], select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: .6rem .85rem; border-radius: 9px; font-size: .87rem; outline: none;
+  }
+  input[type="search"] { flex: 1 1 260px; min-width: 200px; }
+  input[type="search"]:focus, select:focus, button:focus-visible { border-color: var(--accent); }
+  select { flex: 0 0 auto; }
+  button.btn {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text-dim);
+    padding: .6rem .85rem; border-radius: 9px; font-size: .82rem; cursor: pointer;
+  }
+  button.btn:hover { color: var(--text); border-color: var(--accent); }
+  .stat-inline { color: var(--text-dim); font-size: .8rem; margin-left: auto; white-space: nowrap; }
+
+  .images { display: flex; flex-direction: column; gap: .7rem; }
+  .image-card {
+    background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
+    overflow: hidden; min-width: 0; /* évite qu'un flex-item ne s'élargisse au-delà du viewport
+                                        à cause du min-width de la table qu'il contient (le
+                                        défaut flex "min-width:auto" ignorerait sinon le
+                                        overflow-x:auto de .table-scroll) */
+  }
+  .image-card-header {
+    display: flex; align-items: center; gap: .7rem; padding: .85rem 1.1rem; cursor: pointer; user-select: none;
+  }
+  .image-card-header:hover { background: rgba(255,255,255,.02); }
+  .chevron { color: var(--text-faint); font-size: .7rem; transition: transform .15s ease; flex: 0 0 auto; }
+  .image-card.collapsed .chevron { transform: rotate(-90deg); }
+  .image-name { font-weight: 600; font-size: .95rem; overflow-wrap: anywhere; }
+  .image-meta { display:flex; gap: .4rem; flex-wrap: wrap; margin-left: auto; padding-left: 1rem; }
+  .image-card-body { border-top: 1px solid var(--border-soft); }
+  .image-card.collapsed .image-card-body { display: none; }
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel-alt); min-width: 640px; }
+  th, td { text-align:left; padding: .55rem .9rem; border-bottom: 1px solid var(--border-soft); font-size: .82rem; white-space: nowrap; }
+  th { color: var(--text-faint); font-weight:600; font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }
+  tbody tr:last-child td { border-bottom:none; }
+  tbody tr:hover td { background: rgba(255,255,255,.025); }
+  td.tags-cell { white-space: normal; }
+  .tag { display: inline-flex; align-items:center; gap:.3rem; font-family: var(--mono); background: var(--accent-dim); color: var(--accent);
+         padding:.15rem .3rem .15rem .55rem; border-radius:6px; font-size:.78rem; margin: .1rem .25rem .1rem 0; white-space: nowrap; }
+  .tag-copy { opacity: .55; cursor: pointer; padding: .1rem .3rem; border-radius: 4px; line-height:1; }
+  .tag-copy:hover { opacity: 1; background: rgba(91,157,255,.2); }
   .digest { font-family: var(--mono); color: var(--text-dim); font-size:.76rem; cursor: pointer; }
   .digest:hover { color: var(--text); text-decoration: underline dotted; }
   .digest.copied { color: var(--good); }
   .badge { display:inline-block; background: rgba(255,255,255,.06); border:1px solid var(--border);
            padding:.1rem .5rem; border-radius:99px; font-size:.72rem; margin:.1rem .25rem .1rem 0; color: var(--text-dim); }
-  .badge-cosign { background: rgba(91,217,126,.12); border-color: rgba(91,217,126,.35); color: var(--good); }
-  .empty { text-align:center; padding: 3rem; color: var(--text-dim); }
-  footer { margin-top:1.5rem; color: var(--text-dim); font-size:.75rem; }
+  .badge-cosign { background: var(--good-dim); border-color: rgba(91,217,126,.35); color: var(--good); }
+  .pill { display:inline-flex; align-items:center; gap:.3rem; font-size: .74rem; padding: .2rem .55rem; border-radius: 99px;
+          background: rgba(255,255,255,.05); border: 1px solid var(--border); color: var(--text-dim); white-space:nowrap; }
+  .pill-cosign { background: var(--good-dim); border-color: rgba(91,217,126,.35); color: var(--good); }
+  .empty { text-align:center; padding: 3.5rem 1rem; color: var(--text-dim); border: 1px dashed var(--border); border-radius: var(--radius); }
+  footer { margin-top: 2rem; color: var(--text-faint); font-size:.75rem; text-align: center; }
   ::selection { background: rgba(91,157,255,.35); }
+  @media (max-width: 560px) {
+    body { padding: 1.5rem 1rem 3rem; }
+    .image-meta { padding-left: 0; margin-left: 0; width: 100%; }
+    .image-card-header { flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
+<div class="page">
 <header>
   <h1>📦 Registry</h1>
   <div class="subtitle">Générée hors-ligne le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</div>
 </header>
+
+<div class="stats-bar" id="stats-bar"></div>
+
 <div class="controls">
   <input type="search" id="search" placeholder="Filtrer par image, tag, digest ou architecture…">
-  <span class="stat" id="count-label"></span>
+  <select id="sort-mode">
+    <option value="name-asc">Nom (A→Z)</option>
+    <option value="name-desc">Nom (Z→A)</option>
+    <option value="tags-desc">Le plus de tags</option>
+    <option value="size-desc">Le plus volumineux</option>
+    <option value="recent">Récemment modifié</option>
+  </select>
+  <button type="button" class="btn" id="toggle-all">Tout replier</button>
+  <span class="stat-inline" id="count-label"></span>
 </div>
-<div class="table-wrap">
-<table id="registry-table">
-  <thead>
-    <tr>
-      <th data-key="image">Image</th>
-      <th data-key="tag">Tag</th>
-      <th data-key="platforms">Architecture(s)</th>
-      <th data-key="digest">Digest</th>
-      <th>Cosign</th>
-      <th data-key="blobs">Blobs</th>
-      <th data-key="size">Taille manifest</th>
-      <th data-key="mtime">Modifié</th>
-    </tr>
-  </thead>
-  <tbody id="table-body"></tbody>
-</table>
-</div>
+
+<div class="images" id="images"></div>
 <div class="empty" id="empty-state" style="display:none;">Aucune image ne correspond à ce filtre.</div>
-<footer>registry-cli.sh · <span id="total-label"></span></footer>
+<footer>registry-cli.sh</footer>
+</div>
 <script>
 const REGISTRY_DATA =
 HTML_PART1_EOF
@@ -631,7 +690,7 @@ HTML_PART1_EOF
 
     cat >> "$index_file" <<'HTML_PART2_EOF'
 
-let sortKey = "image", sortDir = 1;
+const collapsed = new Set();
 
 function humanSize(bytes) {
     if (bytes < 1024) return bytes + " o";
@@ -652,9 +711,158 @@ function shortDigest(d) {
     return d.length > 19 ? d.slice(0, 19) + "…" : d;
 }
 
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+}
+
+function copyToClipboard(text, el, doneText) {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) return;
+    navigator.clipboard.writeText(text).then(() => {
+        const original = el.textContent;
+        el.textContent = doneText;
+        el.classList.add("copied");
+        setTimeout(() => { el.classList.remove("copied"); el.textContent = original; }, 900);
+    }).catch(() => {});
+}
+
+// Regroupe une liste de lignes (déjà filtrées) par image, puis par digest à
+// l'intérieur de chaque image -- deux tags identiques en contenu (ex:
+// "latest" et "3.21" pointant vers le même manifeste) se retrouvent ainsi
+// affichés ensemble sur une seule ligne, plutôt que dupliqués.
+function groupByImage(rows) {
+    const byImage = new Map();
+    for (const r of rows) {
+        if (!byImage.has(r.image)) byImage.set(r.image, []);
+        byImage.get(r.image).push(r);
+    }
+    const groups = [];
+    for (const [image, entries] of byImage) {
+        const byDigest = new Map();
+        for (const r of entries) {
+            if (!byDigest.has(r.digest)) byDigest.set(r.digest, []);
+            byDigest.get(r.digest).push(r);
+        }
+        const digestGroups = [...byDigest.values()].map(tags => ({
+            tags: tags.map(t => t.tag).sort((a, b) => a.localeCompare(b)),
+            digest: tags[0].digest,
+            platforms: tags[0].platforms,
+            blobs: tags[0].blobs,
+            size: tags[0].size,
+            mtime: tags.map(t => t.mtime).sort().pop(),
+            signed: tags.some(t => t.signed),
+            attested: tags.some(t => t.attested),
+            sbom: tags.some(t => t.sbom),
+        })).sort((a, b) => a.tags.join(",").localeCompare(b.tags.join(",")));
+
+        groups.push({
+            image,
+            digestGroups,
+            tagCount: entries.length,
+            totalSize: entries.reduce((sum, t) => sum + t.size, 0),
+            lastModified: entries.map(t => t.mtime).sort().pop() || "",
+            anySigned: entries.some(t => t.signed || t.attested || t.sbom),
+        });
+    }
+    return groups;
+}
+
+function sortGroups(groups, mode) {
+    const byName = (a, b) => a.image.localeCompare(b.image);
+    switch (mode) {
+        case "name-desc": return groups.sort((a, b) => -byName(a, b));
+        case "tags-desc": return groups.sort((a, b) => b.tagCount - a.tagCount || byName(a, b));
+        case "size-desc": return groups.sort((a, b) => b.totalSize - a.totalSize || byName(a, b));
+        case "recent": return groups.sort((a, b) => b.lastModified.localeCompare(a.lastModified) || byName(a, b));
+        default: return groups.sort(byName);
+    }
+}
+
+function renderStats() {
+    const nImages = new Set(REGISTRY_DATA.map(r => r.image)).size;
+    const nTags = REGISTRY_DATA.length;
+    const nSigned = REGISTRY_DATA.filter(r => r.signed || r.attested || r.sbom).length;
+    const totalSize = REGISTRY_DATA.reduce((sum, r) => sum + r.size, 0);
+
+    document.getElementById("stats-bar").innerHTML = `
+        <div class="stat-tile"><div class="stat-value">${nImages}</div><div class="stat-label">Image${nImages === 1 ? "" : "s"}</div></div>
+        <div class="stat-tile"><div class="stat-value">${nTags}</div><div class="stat-label">Tag${nTags === 1 ? "" : "s"}</div></div>
+        <div class="stat-tile"><div class="stat-value good">${nSigned}</div><div class="stat-label">Avec cosign</div></div>
+        <div class="stat-tile"><div class="stat-value accent">${humanSize(totalSize)}</div><div class="stat-label">Volume manifestes</div></div>
+    `;
+}
+
+function renderGroup(g) {
+    const isCollapsed = collapsed.has(g.image);
+
+    const metaPills = [
+        `<span class="pill">${g.tagCount} tag${g.tagCount === 1 ? "" : "s"}</span>`,
+        g.anySigned ? '<span class="pill pill-cosign">🔏 cosign</span>' : "",
+        `<span class="pill">${humanSize(g.totalSize)}</span>`,
+    ].join("");
+
+    const rowsHtml = g.digestGroups.map(dg => {
+        const tagBadges = dg.tags.map(t => {
+            const label = t || "(sans tag)";
+            const copyPayload = t ? `${g.image}:${t}` : g.image;
+            return `<span class="tag">${escapeHtml(label)}<span class="tag-copy" data-copy="${escapeHtml(copyPayload)}" title="Copier « ${escapeHtml(copyPayload)} »">⧉</span></span>`;
+        }).join("");
+
+        const platformBadges = dg.platforms.split(",").map(p => p.trim()).filter(Boolean)
+            .map(p => `<span class="badge">${escapeHtml(p)}</span>`).join("") || '<span class="badge">unknown</span>';
+
+        const cosignBadges = [
+            dg.signed ? '<span class="badge badge-cosign" title="Signature cosign présente (sha256-&lt;digest&gt;.sig)">🔏 signé</span>' : '',
+            dg.attested ? '<span class="badge badge-cosign" title="Attestation cosign présente (sha256-&lt;digest&gt;.att)">📎 attesté</span>' : '',
+            dg.sbom ? '<span class="badge badge-cosign" title="SBOM présent (sha256-&lt;digest&gt;.sbom)">📄 SBOM</span>' : '',
+        ].join("") || '<span class="badge">—</span>';
+
+        return `
+            <tr>
+                <td class="tags-cell">${tagBadges}</td>
+                <td>${platformBadges}</td>
+                <td class="digest" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${shortDigest(dg.digest)}</td>
+                <td>${cosignBadges}</td>
+                <td>${dg.blobs}</td>
+                <td>${humanSize(dg.size)}</td>
+                <td>${humanDate(dg.mtime)}</td>
+            </tr>`;
+    }).join("");
+
+    const card = document.createElement("div");
+    card.className = "image-card" + (isCollapsed ? " collapsed" : "");
+    card.innerHTML = `
+        <div class="image-card-header" data-toggle="${escapeHtml(g.image)}">
+            <span class="chevron">▾</span>
+            <span class="image-name">${escapeHtml(g.image)}</span>
+            <span class="image-meta">${metaPills}</span>
+        </div>
+        <div class="image-card-body">
+            <div class="table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Tag(s)</th>
+                            <th>Architecture(s)</th>
+                            <th>Digest</th>
+                            <th>Cosign</th>
+                            <th>Blobs</th>
+                            <th>Taille</th>
+                            <th>Modifié</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rowsHtml}</tbody>
+                </table>
+            </div>
+        </div>
+    `;
+    return card;
+}
+
 function render() {
     const q = document.getElementById("search").value.trim().toLowerCase();
-    let rows = REGISTRY_DATA.filter(r =>
+    const filtered = REGISTRY_DATA.filter(r =>
         !q ||
         r.image.toLowerCase().includes(q) ||
         r.tag.toLowerCase().includes(q) ||
@@ -662,74 +870,55 @@ function render() {
         r.platforms.toLowerCase().includes(q)
     );
 
-    rows.sort((a, b) => {
-        let av = a[sortKey], bv = b[sortKey];
-        if (typeof av === "number") return (av - bv) * sortDir;
-        return String(av).localeCompare(String(bv)) * sortDir;
-    });
+    const groups = sortGroups(groupByImage(filtered), document.getElementById("sort-mode").value);
 
-    const tbody = document.getElementById("table-body");
-    tbody.innerHTML = "";
+    const container = document.getElementById("images");
+    container.innerHTML = "";
+    for (const g of groups) container.appendChild(renderGroup(g));
 
-    document.getElementById("empty-state").style.display = rows.length ? "none" : "block";
-    document.querySelector(".table-wrap").style.display = rows.length ? "block" : "none";
+    document.getElementById("empty-state").style.display = groups.length ? "none" : "block";
+    container.style.display = groups.length ? "flex" : "none";
 
-    for (const r of rows) {
-        const tr = document.createElement("tr");
-
-        const platformBadges = r.platforms.split(",").map(p => p.trim()).filter(Boolean)
-            .map(p => `<span class="badge">${p}</span>`).join("");
-
-        const cosignBadges = [
-            r.signed ? '<span class="badge badge-cosign" title="Signature cosign présente (sha256-&lt;digest&gt;.sig)">🔏 signé</span>' : '',
-            r.attested ? '<span class="badge badge-cosign" title="Attestation cosign présente (sha256-&lt;digest&gt;.att)">📎 attesté</span>' : '',
-            r.sbom ? '<span class="badge badge-cosign" title="SBOM présent (sha256-&lt;digest&gt;.sbom)">📄 SBOM</span>' : '',
-        ].join("") || '<span class="badge">—</span>';
-
-        tr.innerHTML = `
-            <td class="image-name">${r.image}</td>
-            <td><span class="tag">${r.tag || "(sans tag)"}</span></td>
-            <td>${platformBadges || '<span class="badge">unknown</span>'}</td>
-            <td class="digest" title="${r.digest} (cliquer pour copier)" data-digest="${r.digest}">${shortDigest(r.digest)}</td>
-            <td>${cosignBadges}</td>
-            <td>${r.blobs}</td>
-            <td>${humanSize(r.size)}</td>
-            <td>${humanDate(r.mtime)}</td>
-        `;
-        tbody.appendChild(tr);
-    }
-
-    const nImages = new Set(REGISTRY_DATA.map(r => r.image)).size;
     document.getElementById("count-label").textContent =
-        rows.length + " / " + REGISTRY_DATA.length + " tag(s) affiché(s)";
-    document.getElementById("total-label").textContent =
-        nImages + " image(s), " + REGISTRY_DATA.length + " tag(s) au total";
+        filtered.length + " / " + REGISTRY_DATA.length + " tag(s) · " + groups.length + " image(s) affichée(s)";
 }
 
 document.getElementById("search").addEventListener("input", render);
+document.getElementById("sort-mode").addEventListener("change", render);
 
-document.querySelectorAll("th[data-key]").forEach(th => {
-    th.addEventListener("click", () => {
-        const key = th.dataset.key;
-        if (sortKey === key) { sortDir *= -1; } else { sortKey = key; sortDir = 1; }
-        render();
+document.getElementById("toggle-all").addEventListener("click", (e) => {
+    const allCollapsed = document.querySelectorAll(".image-card").length ===
+        document.querySelectorAll(".image-card.collapsed").length;
+    document.querySelectorAll(".image-card").forEach(card => {
+        const key = card.querySelector(".image-card-header").dataset.toggle;
+        if (allCollapsed) { collapsed.delete(key); card.classList.remove("collapsed"); }
+        else { collapsed.add(key); card.classList.add("collapsed"); }
     });
+    e.target.textContent = allCollapsed ? "Tout replier" : "Tout déplier";
 });
 
-document.getElementById("table-body").addEventListener("click", (e) => {
-    const cell = e.target.closest(".digest");
-    if (!cell) return;
-    const digest = cell.dataset.digest;
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(digest).then(() => {
-            cell.classList.add("copied");
-            const original = cell.textContent;
-            cell.textContent = "copié !";
-            setTimeout(() => { cell.classList.remove("copied"); cell.textContent = original; }, 900);
-        }).catch(() => {});
+document.getElementById("images").addEventListener("click", (e) => {
+    const header = e.target.closest(".image-card-header");
+    if (header) {
+        const key = header.dataset.toggle;
+        const card = header.closest(".image-card");
+        if (collapsed.has(key)) { collapsed.delete(key); card.classList.remove("collapsed"); }
+        else { collapsed.add(key); card.classList.add("collapsed"); }
+        return;
+    }
+    const digestCell = e.target.closest(".digest");
+    if (digestCell) {
+        copyToClipboard(digestCell.dataset.digest, digestCell, "copié !");
+        return;
+    }
+    const tagCopy = e.target.closest(".tag-copy");
+    if (tagCopy) {
+        e.stopPropagation();
+        copyToClipboard(tagCopy.dataset.copy, tagCopy, "✓");
     }
 });
 
+renderStats();
 render();
 </script>
 </body>
