@@ -293,10 +293,20 @@ registry-cli.sh index -r REGISTRY_ROOT
 
 Génère `REGISTRY_ROOT/index.html` : un tableau de bord statique et
 **entièrement autonome** (CSS/JS inline, aucune ressource externe, aucun
-CDN) listant toutes les images, tags, architectures, digests, nombre de
-blobs, taille et date de modification. Recherche et tri se font côté
-client en JavaScript pur ; cliquer sur un digest le copie dans le
-presse-papier.
+CDN), organisé **par image** plutôt qu'en table plate : chaque image est une
+carte repliable regroupant tous ses tags, et à l'intérieur d'une carte, les
+tags qui pointent vers un **contenu identique** (ex: `latest` et `3.21`
+poussés sur le même digest) sont affichés sur une seule ligne au lieu
+d'être dupliqués. Chaque ligne montre architecture(s), digest, badges
+cosign, nombre de blobs, taille et date de modification.
+
+Une barre de statistiques en tête (nombre d'images, de tags, d'images
+signées/attestées, volume total) donne une vue d'ensemble immédiate.
+Recherche et tri (nom, nombre de tags, taille, date) se font côté client en
+JavaScript pur ; un bouton reploie/déplie toutes les cartes d'un coup, et
+chaque carte individuellement au clic sur son en-tête. Cliquer sur un
+digest, ou sur l'icône ⧉ à côté d'un tag, le copie dans le presse-papier
+(`image:tag` pour un tag, le digest complet sinon).
 
 L'architecture est détectée automatiquement :
 - pour une **manifest-list** (multi-arch), depuis les champs

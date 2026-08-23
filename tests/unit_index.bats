@@ -107,6 +107,37 @@ JSON
     grep -q '\[\];' "${ROOT}/index.html"
 }
 
+@test "regen_index_html: contient les points d'ancrage JS du tableau de bord groupé par image" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    # Regression : le tableau de bord regroupe les tags par image (et par
+    # digest à l'intérieur d'une image) côté client -- ces points d'ancrage
+    # doivent rester présents pour que le JS puisse s'y accrocher.
+    grep -q 'id="stats-bar"' "${ROOT}/index.html"
+    grep -q 'id="images"' "${ROOT}/index.html"
+    grep -q 'id="sort-mode"' "${ROOT}/index.html"
+    grep -q 'id="toggle-all"' "${ROOT}/index.html"
+    grep -q 'function groupByImage' "${ROOT}/index.html"
+}
+
+@test "regen_index_html: deux tags de contenu identique restent deux entrées JSON distinctes (le regroupement est côté JS)" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+    # Second tag pointant vers exactement le même contenu (même digest) --
+    # simule "latest" pointant sur la même image que "3.20".
+    cp "${ROOT}/v2/myimage/manifests/3.20" "${ROOT}/v2/myimage/manifests/latest"
+
+    regen_index_html "$ROOT"
+
+    grep -q '"tag":"3.20"' "${ROOT}/index.html"
+    grep -q '"tag":"latest"' "${ROOT}/index.html"
+}
+
 @test "escape_json_string appliqué: un nom d'image avec guillemet ne casse pas le JSON produit" {
     mkdir -p "${ROOT}/v2/weird\"image/manifests" "${ROOT}/v2/weird\"image/blobs"
     echo '{"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}' \
