@@ -746,6 +746,10 @@ regen_index_html() {
   .chevron { color: var(--text-faint); font-size: .65rem; transition: transform .15s ease; flex: 0 0 auto; }
   .image-card.collapsed .chevron { transform: rotate(-90deg); }
   .image-name { font-weight: 600; font-size: .9rem; overflow-wrap: anywhere; font-family: var(--mono); }
+  /* Préfixe hôte:port -- identique à celui utilisé lors de la copie (voir
+     HOST_PREFIX en JS), affiché en plus discret pour que le nom d'image
+     reste la partie visuellement dominante. */
+  .image-host-prefix { color: var(--text-faint); font-weight: 400; }
   .image-meta { display:flex; gap: .35rem; flex-wrap: wrap; margin-left: auto; padding-left: .85rem; }
   .image-card-body { border-top: 1px solid var(--border-soft); }
   .image-card.collapsed .image-card-body { display: none; }
@@ -1083,7 +1087,7 @@ function renderGroup(g) {
     card.innerHTML = `
         <div class="image-card-header" data-toggle="${escapeHtml(g.image)}">
             <span class="chevron">▾</span>
-            <span class="image-name">${escapeHtml(g.image)}</span>
+            <span class="image-name"><span class="image-host-prefix">${escapeHtml(HOST_PREFIX)}</span>${escapeHtml(g.image)}</span>
             <span class="image-meta">${metaPills}</span>
         </div>
         <div class="image-card-body">${rowsHtml}</div>
