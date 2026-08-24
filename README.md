@@ -447,6 +447,51 @@ REGISTRY_ROOT/
             └── sha256:<digest>     # config JSON + layers (pas de .htaccess)
 ```
 
+## Servir la registry avec Apache2
+
+Le protocole registry v2 a besoin que chaque manifeste soit servi avec le
+bon `Content-Type` (schéma 1 vs schéma 2/OCI) et l'en-tête
+`Docker-Content-Digest`. Comme il n'y a pas de serveur applicatif ici, ce
+script s'appuie entièrement sur des fichiers `.htaccess` (`ForceType`,
+`Header add`) déposés dans chaque répertoire `manifests/`.
+
+**Pour que ces `.htaccess` soient pris en compte, Apache doit avoir
+`AllowOverride All` (ou au moins `FileInfo`) sur le répertoire servi.**
+Ce n'est **pas** le réglage par défaut de l'image officielle
+`httpd:2.4` (son `httpd.conf` a `AllowOverride None`) : sans ce réglage,
+Apache ignore silencieusement tous les `.htaccess` — aucun `Content-Type`
+ni `Docker-Content-Digest` n'est envoyé, et `podman`/`docker pull` échoue
+typiquement avec `unsupported schema version 2` (schéma 2 lu comme
+schéma 1faute de `Content-Type`).
+
+Pour tester rapidement avec l'image officielle telle quelle, ajoutez les
+options `-c` qui activent `AllowOverride All` au démarrage, sans fichier
+de config supplémentaire :
+
+```bash
+podman run -dit --name my-apache-app -p 8000:80 \
+    -v "$PWD":/usr/local/apache2/htdocs/ \
+    docker.io/library/httpd:2.4 \
+    httpd-foreground \
+    -c "<Directory /usr/local/apache2/htdocs>" \
+    -c "AllowOverride All" \
+    -c "</Directory>"
+```
+
+(remplacez `podman` par `docker` au besoin ; la syntaxe est identique).
+Vérification rapide une fois le conteneur démarré :
+
+```bash
+curl -sI http://localhost:8000/v2/<image>/manifests/<tag>
+# doit contenir Content-Type: application/vnd.oci.image.manifest.v1+json
+# (ou +prettyjws pour du schéma 1) et Docker-Content-Digest: sha256:...
+# Si ces deux en-têtes sont absents, .htaccess n'est pas honoré.
+```
+
+En production, préférez une image Apache dédiée (Dockerfile avec
+`AllowOverride All` dans un vhost, ou config équivalente sur un Apache
+"nu") plutôt que ces `-c` en ligne de commande.
+
 ## Workflows type
 
 **Signature et vérification GPG de bout en bout :**

@@ -499,6 +499,11 @@ regen_apache2_config() {
 
     echo "    v2/.htaccess, v2/error.json, un .htaccess par image (manifests/) et"
     echo "    un .htaccess anti-compression par image (blobs/) ont été écrits."
+    echo "    Rappel : ces .htaccess ne sont pris en compte que si Apache a"
+    echo "    'AllowOverride All' (ou 'FileInfo') sur ce répertoire — ce n'est"
+    echo "    PAS le réglage par défaut de l'image httpd:2.4 officielle. Sans"
+    echo "    ça, podman/docker pull échoue avec 'unsupported schema version 2'"
+    echo "    (voir section 'Servir la registry avec Apache2' du README)."
 }
 
 # ===========================================================================
