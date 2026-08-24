@@ -593,7 +593,7 @@ regen_index_html() {
 
     local manifest_dir image_dir image_name blobs_dir blob_count
     local tag_file tag_name digest digest_hex size mtime platforms
-    local has_sig has_att has_sbom
+    local has_sig has_att has_sbom config_digest
     local entries=()
 
     while IFS= read -r manifest_dir; do
@@ -609,6 +609,9 @@ regen_index_html() {
             digest_hex="${digest#sha256:}"
             mtime="$(date -u -r "$tag_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
             platforms="$(get_manifest_platforms "$tag_file" "$blobs_dir")"
+            # Vide pour un manifest-list/index (pas de config au niveau
+            # racine, seulement pour chaque manifeste par plateforme).
+            config_digest="$(get_config_digest_from_manifest "$tag_file")"
             has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
             has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
             has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
@@ -620,9 +623,9 @@ regen_index_html() {
             [[ "$has_sig" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sig" "$blobs_dir")))
             [[ "$has_att" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.att" "$blobs_dir")))
             [[ "$has_sbom" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sbom" "$blobs_dir")))
-            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
+            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","config_digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
                 "$(escape_json_string "$image_name")" "$(escape_json_string "$tag_name")" \
-                "$digest" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
+                "$digest" "$(escape_json_string "$config_digest")" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
                 "$has_sig" "$has_att" "$has_sbom")")
         done < <(list_manifest_entries "$manifest_dir")
     done < <(find "${root}/v2" -type d -name manifests 2>/dev/null | sort)
@@ -741,6 +744,7 @@ regen_index_html() {
   .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; cursor: pointer; }
   .digest:hover { color: var(--text); text-decoration: underline dotted; }
   .digest.copied { color: var(--good); }
+  .digest-none { font-family: var(--mono); color: var(--text-faint); font-size:.72rem; }
   .badge { display:inline-block; background: var(--hover-strong); border:1px solid var(--border);
            padding:.05rem .45rem; border-radius:99px; font-size:.68rem; margin:.08rem .2rem .08rem 0; color: var(--text-dim); }
   .badge-cosign { background: var(--good-dim); border-color: #b7e6c9; color: var(--good); }
@@ -848,6 +852,7 @@ function groupByImage(rows) {
         const digestGroups = [...byDigest.values()].map(tags => ({
             tags: tags.map(t => t.tag).sort((a, b) => a.localeCompare(b)),
             digest: tags[0].digest,
+            configDigest: tags[0].config_digest,
             platforms: tags[0].platforms,
             blobs: tags[0].blobs,
             size: tags[0].size,
@@ -919,11 +924,16 @@ function renderGroup(g) {
             dg.sbom ? '<span class="badge badge-cosign" title="SBOM présent (sha256-&lt;digest&gt;.sbom)">📄 SBOM</span>' : '',
         ].join("") || '<span class="badge">—</span>';
 
+        const configCell = dg.configDigest
+            ? `<td class="digest" title="${dg.configDigest} (cliquer pour copier)" data-digest="${dg.configDigest}">${shortDigest(dg.configDigest)}</td>`
+            : `<td class="digest-none" title="Pas de config au niveau racine (manifest-list/index)">—</td>`;
+
         return `
             <tr>
                 <td class="tags-cell">${tagBadges}</td>
                 <td>${platformBadges}</td>
                 <td class="digest" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${shortDigest(dg.digest)}</td>
+                ${configCell}
                 <td>${cosignBadges}</td>
                 <td>${dg.blobs}</td>
                 <td>${humanSize(dg.size)}</td>
@@ -946,7 +956,8 @@ function renderGroup(g) {
                         <tr>
                             <th>Tag(s)</th>
                             <th>Architecture(s)</th>
-                            <th>Digest</th>
+                            <th>Digest (manifest)</th>
+                            <th>Digest (config)</th>
                             <th>Cosign</th>
                             <th>Blobs</th>
                             <th>Taille</th>
