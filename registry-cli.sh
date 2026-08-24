@@ -149,6 +149,30 @@ extract_referenced_digests() {
         | grep -oE 'sha256:[0-9a-f]+' | sed 's/^sha256://' | sort -u
 }
 
+# ---------------------------------------------------------------------------
+# Utilitaire partagé : taille en octets d'un manifeste PLUS tout ce qu'il
+# référence et qui existe réellement dans blobs_dir (config, layers -- un
+# digest référencé mais absent, ex: un sous-manifeste de manifest-list ou
+# un digest hors de cette image, est simplement ignoré). C'est la "taille de
+# l'image" au sens utile (ce qui sera effectivement transféré par un
+# pull/push), pas la taille du seul fichier JSON du manifeste.
+# ---------------------------------------------------------------------------
+file_size_bytes() {
+    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+manifest_total_size() {
+    local manifest_file="$1" blobs_dir="$2"
+    local total d blob_file
+    total="$(file_size_bytes "$manifest_file")"
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        blob_file="${blobs_dir}/sha256:${d}"
+        [[ -f "$blob_file" ]] && total=$((total + $(file_size_bytes "$blob_file")))
+    done < <(extract_referenced_digests "$manifest_file")
+    printf '%s' "$total"
+}
+
 # Lit le champ "mediaType" d'un fichier JSON de manifeste. Utilise jq si
 # disponible (comme le script original), sinon un repli par grep/sed.
 # Retourne la chaîne "null" si le champ est absent, comme jq -r le ferait.
@@ -161,6 +185,50 @@ read_media_type() {
         mt="$(grep -oE '"mediaType"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
         [[ -n "$mt" ]] && echo "$mt" || echo "null"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Devine le type MIME d'un manifeste dont le champ "mediaType" est ABSENT,
+# à partir de "schemaVersion" et de la forme du document.
+#
+# Un manifeste JSON schema1 (l'ancien format) n'a jamais de "mediaType" --
+# c'était l'hypothèse (correcte à l'époque) derrière le repli historique de
+# gen-apache2.sh vers "application/vnd.docker.distribution.manifest.v1+prettyjws"
+# quand ce champ manque. Mais un manifeste ou index OCI schemaVersion:2 peut
+# LÉGITIMEMENT omettre "mediaType" lui aussi (le protocole OCI Distribution
+# prévoit que le Content-Type HTTP le porte à la place lors de la
+# négociation de contenu) -- de plus en plus fréquent, Docker Hub servant
+# désormais nombre d'images au format OCI. Sur une registry STATIQUE comme
+# celle-ci, il n'y a pas de négociation de contenu : c'est justement ce
+# ForceType qui joue ce rôle. S'y tromper fait mentir Apache sur le format
+# réel du manifeste, et casse le pull côté client : podman/docker refusent
+# alors le contenu avec "unsupported schema version 2" (le manifeste est
+# bien schema2/OCI, mais annoncé comme schema1 par le Content-Type).
+# ---------------------------------------------------------------------------
+guess_media_type_for_missing_field() {
+    local f="$1" schema_version has_manifests has_config_and_layers
+    if command -v jq >/dev/null 2>&1; then
+        schema_version="$(jq -r '.schemaVersion // empty' "$f" 2>/dev/null)"
+        has_manifests="$(jq -r 'if (.manifests | type) == "array" then "yes" else "no" end' "$f" 2>/dev/null)"
+        has_config_and_layers="$(jq -r 'if (.config != null and (.layers | type) == "array") then "yes" else "no" end' "$f" 2>/dev/null)"
+    else
+        schema_version="$(grep -oE '"schemaVersion"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | head -1 | grep -oE '[0-9]+$')"
+        if grep -q '"manifests"[[:space:]]*:[[:space:]]*\[' "$f" 2>/dev/null; then has_manifests="yes"; else has_manifests="no"; fi
+        if grep -q '"config"' "$f" 2>/dev/null && grep -q '"layers"[[:space:]]*:[[:space:]]*\[' "$f" 2>/dev/null; then has_config_and_layers="yes"; else has_config_and_layers="no"; fi
+    fi
+
+    if [[ "$schema_version" == "2" ]]; then
+        if [[ "$has_manifests" == "yes" ]]; then
+            printf 'application/vnd.oci.image.index.v1+json'
+            return 0
+        fi
+        if [[ "$has_config_and_layers" == "yes" ]]; then
+            printf 'application/vnd.oci.image.manifest.v1+json'
+            return 0
+        fi
+    fi
+    # schemaVersion 1, absent, ou forme non reconnue : repli historique.
+    printf 'application/vnd.docker.distribution.manifest.v1+prettyjws'
 }
 
 # ---------------------------------------------------------------------------
@@ -410,7 +478,7 @@ regen_apache2_config() {
                 base="$(basename "$f")"
                 [[ "$base" == ".htaccess" ]] && continue
                 content_type="$(read_media_type "$f")"
-                [[ "$content_type" == "null" ]] && content_type="application/vnd.docker.distribution.manifest.v1+prettyjws"
+                [[ "$content_type" == "null" ]] && content_type="$(guess_media_type_for_missing_field "$f")"
                 printf '<Files %s>\n  ForceType %s\n</Files>\n' "$base" "$content_type"
             done
             for f in "$manifest_dir"/*; do
@@ -520,12 +588,19 @@ regen_index_html() {
             [[ "$tag_name" == "$NO_TAG_MARKER" ]] && tag_name=""
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
             digest_hex="${digest#sha256:}"
-            size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo 0)"
             mtime="$(date -u -r "$tag_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
             platforms="$(get_manifest_platforms "$tag_file" "$blobs_dir")"
             has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
             has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
             has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
+            # Taille de l'IMAGE (manifeste + tous les blobs qu'il référence),
+            # pas juste celle du petit fichier JSON du manifeste -- plus les
+            # artefacts cosign présents (signature/attestation/SBOM et leurs
+            # propres blobs, ex: l'enveloppe DSSE), pour un total réaliste.
+            size="$(manifest_total_size "$tag_file" "$blobs_dir")"
+            [[ "$has_sig" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sig" "$blobs_dir")))
+            [[ "$has_att" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.att" "$blobs_dir")))
+            [[ "$has_sbom" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sbom" "$blobs_dir")))
             entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
                 "$(escape_json_string "$image_name")" "$(escape_json_string "$tag_name")" \
                 "$digest" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
@@ -627,7 +702,13 @@ regen_index_html() {
   .image-meta { display:flex; gap: .35rem; flex-wrap: wrap; margin-left: auto; padding-left: .85rem; }
   .image-card-body { border-top: 1px solid var(--border-soft); }
   .image-card.collapsed .image-card-body { display: none; }
-  .table-scroll { overflow-x: auto; }
+  .table-scroll {
+    overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .table-scroll::-webkit-scrollbar { height: 6px; }
+  .table-scroll::-webkit-scrollbar-track { background: transparent; }
+  .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+  .table-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
   table { width: 100%; border-collapse: collapse; background: var(--panel-alt); min-width: 620px; }
   th, td { text-align:left; padding: .4rem .8rem; border-bottom: 1px solid var(--border-soft); font-size: .78rem; white-space: nowrap; }
   th { color: var(--text-faint); font-weight:600; font-size:.68rem; text-transform:uppercase; letter-spacing:.03em; }
@@ -790,7 +871,7 @@ function renderStats() {
         <div class="stat-tile"><div class="stat-value">${nImages}</div><div class="stat-label">Image${nImages === 1 ? "" : "s"}</div></div>
         <div class="stat-tile"><div class="stat-value">${nTags}</div><div class="stat-label">Tag${nTags === 1 ? "" : "s"}</div></div>
         <div class="stat-tile"><div class="stat-value good">${nSigned}</div><div class="stat-label">Avec cosign</div></div>
-        <div class="stat-tile"><div class="stat-value accent">${humanSize(totalSize)}</div><div class="stat-label">Volume manifestes</div></div>
+        <div class="stat-tile"><div class="stat-value accent">${humanSize(totalSize)}</div><div class="stat-label">Volume total</div></div>
     `;
 }
 
@@ -1415,11 +1496,16 @@ cmd_list() {
             [[ "$tag_name" == "$NO_TAG_MARKER" ]] && tag_name=""
             digest="sha256:$(sha256sum "$tag_file" | cut -d' ' -f1)"
             digest_hex="${digest#sha256:}"
-            size="$(stat -c%s "$tag_file" 2>/dev/null || stat -f%z "$tag_file" 2>/dev/null || echo "?")"
             mtime="$(date -u -r "$tag_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?")"
             has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
             has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
             has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
+            # Taille de l'IMAGE (manifeste + blobs référencés + artefacts
+            # cosign présents), pas juste celle du fichier JSON du manifeste.
+            size="$(manifest_total_size "$tag_file" "$blobs_dir")"
+            [[ "$has_sig" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sig" "$blobs_dir")))
+            [[ "$has_att" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.att" "$blobs_dir")))
+            [[ "$has_sbom" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sbom" "$blobs_dir")))
             cosign_summary=""
             [[ "$has_sig" == "true" ]] && cosign_summary="sig"
             [[ "$has_att" == "true" ]] && cosign_summary="${cosign_summary:+${cosign_summary},}att"
@@ -1441,14 +1527,14 @@ cmd_list() {
         for row in "${rows[@]}"; do
             IFS='|' read -r image tag digest cosign_summary has_sig has_att has_sbom blobs size mtime <<< "$row"
             i=$((i+1))
-            printf '  {"image": "%s", "tag": "%s", "digest": "%s", "signature": %s, "attestation": %s, "sbom": %s, "blobs": %s, "manifest_size": %s, "last_modified": "%s"}%s\n' \
+            printf '  {"image": "%s", "tag": "%s", "digest": "%s", "signature": %s, "attestation": %s, "sbom": %s, "blobs": %s, "size": %s, "last_modified": "%s"}%s\n' \
                 "$image" "$tag" "$digest" "$has_sig" "$has_att" "$has_sbom" "$blobs" "$size" "$mtime" \
                 "$([[ $i -lt $n ]] && echo ',')"
         done
         echo "]"
     else
         {
-            printf 'IMAGE\tTAG\tDIGEST\tCOSIGN\tBLOBS\tMANIFEST_SIZE\tLAST_MODIFIED\n'
+            printf 'IMAGE\tTAG\tDIGEST\tCOSIGN\tBLOBS\tSIZE\tLAST_MODIFIED\n'
             for row in "${rows[@]}"; do
                 IFS='|' read -r image tag digest cosign_summary has_sig has_att has_sbom blobs size mtime <<< "$row"
                 [[ -z "$tag" ]] && tag="(sans tag)"

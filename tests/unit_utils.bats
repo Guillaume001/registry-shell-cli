@@ -141,3 +141,36 @@ JSON
     run escape_json_string 'library/nginx'
     [ "$output" = 'library/nginx' ]
 }
+
+# --- manifest_total_size ---------------------------------------------------
+
+@test "manifest_total_size: manifeste + tous les blobs qu'il référence et qui existent" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    local v2="${BATS_TEST_TMPDIR}/v2"
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "$v2"
+
+    local manifest_file="${v2}/myimage/manifests/3.20"
+    local blobs_dir="${v2}/myimage/blobs"
+
+    local expected
+    expected="$(file_size_bytes "$manifest_file")"
+    local f
+    for f in "${blobs_dir}"/sha256:*; do
+        expected=$((expected + $(file_size_bytes "$f")))
+    done
+
+    run manifest_total_size "$manifest_file" "$blobs_dir"
+    [ "$output" = "$expected" ]
+    # Doit être nettement plus grand que la seule taille du fichier JSON du
+    # manifeste (c'était le bug : "Taille" n'affichait que ça).
+    [ "$expected" -gt "$(file_size_bytes "$manifest_file")" ]
+}
+
+@test "manifest_total_size: ignore un digest référencé mais absent de blobs_dir" {
+    local f="${BATS_TEST_TMPDIR}/manifest.json"
+    echo '{"config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000"}}' > "$f"
+    local blobs_dir="${BATS_TEST_TMPDIR}/no-such-blobs"
+    run manifest_total_size "$f" "$blobs_dir"
+    [ "$output" = "$(file_size_bytes "$f")" ]
+}
