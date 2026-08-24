@@ -111,6 +111,16 @@ JSON
     grep -q "\"config_digest\":\"sha256:${config_digest}\"" "${ROOT}/index.html"
 }
 
+@test "regen_index_html: expose le media type du manifeste" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    grep -q '"media_type":"application/vnd.docker.distribution.manifest.v2+json"' "${ROOT}/index.html"
+}
+
 @test "regen_index_html: manifest-list (pas de config au niveau racine) -> config_digest vide" {
     local manifest_dir="${ROOT}/v2/myimage/manifests"
     mkdir -p "$manifest_dir" "${ROOT}/v2/myimage/blobs"

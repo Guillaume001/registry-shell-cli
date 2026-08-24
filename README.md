@@ -295,23 +295,28 @@ registry-cli.sh index -r REGISTRY_ROOT
 
 Génère `REGISTRY_ROOT/index.html` : un tableau de bord statique et
 **entièrement autonome** (CSS/JS inline, aucune ressource externe, aucun
-CDN), organisé **par image** plutôt qu'en table plate : chaque image est une
-carte repliable regroupant tous ses tags, et à l'intérieur d'une carte, les
-tags qui pointent vers un **contenu identique** (ex: `latest` et `3.21`
-poussés sur le même digest) sont affichés sur une seule ligne au lieu
-d'être dupliqués. Chaque ligne montre architecture(s), digest du
-**manifeste**, digest de la **config** (celui du blob `config.json` référencé
-par le manifeste — vide pour une manifest-list/index, qui n'a pas de config
-à son propre niveau), badges cosign, nombre de blobs, taille et date de
-modification.
+CDN), au thème sombre inspiré du container registry de GitLab, organisé
+**par image** plutôt qu'en table plate : chaque image est une carte
+repliable regroupant tous ses tags, et à l'intérieur d'une carte, les tags
+qui pointent vers un **contenu identique** (ex: `latest` et `3.21` poussés
+sur le même digest) sont affichés sur une seule ligne au lieu d'être
+dupliqués. Chaque ligne (repliée par défaut, comme sur GitLab) montre
+tag(s), architecture(s), badges cosign, taille et digest du manifeste
+tronqué ; cliquer dessus déplie un panneau de détail avec le digest complet
+du **manifeste**, son **media type**, le digest de la **config** (le blob
+`config.json` référencé — absent pour une manifest-list/index, qui n'a pas
+de config à son propre niveau) et le nombre de blobs.
 
-Une barre de statistiques en tête (nombre d'images, de tags, d'images
-signées/attestées, volume total) donne une vue d'ensemble immédiate.
-Recherche et tri (nom, nombre de tags, taille, date) se font côté client en
-JavaScript pur ; un bouton reploie/déplie toutes les cartes d'un coup, et
-chaque carte individuellement au clic sur son en-tête. Cliquer sur un
-digest (manifeste ou config), ou sur l'icône ⧉ à côté d'un tag, le copie
-dans le presse-papier (`image:tag` pour un tag, le digest complet sinon).
+Une ligne de statistiques en tête (nombre d'images, de tags, volume total,
+images avec cosign) donne une vue d'ensemble immédiate. Recherche et tri
+(nom, nombre de tags, taille, date) se font côté client en JavaScript pur ;
+un bouton reploie/déplie toutes les cartes d'un coup, et chaque carte
+individuellement au clic sur son en-tête. Cliquer sur un digest (manifeste
+ou config), ou sur l'icône ⧉ à côté d'un tag, le copie dans le
+presse-papier — préfixé par l'hôte:port qui sert effectivement la page
+(ex. `localhost:8000/alpine:3.20`, ou `localhost:8000/ubi10@sha256:...`
+pour une image sans tag), donc directement utilisable avec
+`podman`/`docker pull`.
 
 L'architecture est détectée automatiquement :
 - pour une **manifest-list** (multi-arch), depuis les champs

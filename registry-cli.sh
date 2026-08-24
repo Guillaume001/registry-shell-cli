@@ -593,7 +593,7 @@ regen_index_html() {
 
     local manifest_dir image_dir image_name blobs_dir blob_count
     local tag_file tag_name digest digest_hex size mtime platforms
-    local has_sig has_att has_sbom config_digest
+    local has_sig has_att has_sbom config_digest media_type
     local entries=()
 
     while IFS= read -r manifest_dir; do
@@ -612,6 +612,8 @@ regen_index_html() {
             # Vide pour un manifest-list/index (pas de config au niveau
             # racine, seulement pour chaque manifeste par plateforme).
             config_digest="$(get_config_digest_from_manifest "$tag_file")"
+            media_type="$(read_media_type "$tag_file")"
+            [[ "$media_type" == "null" ]] && media_type="$(guess_media_type_for_missing_field "$tag_file")"
             has_sig="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sig" ]] && has_sig="true"
             has_att="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.att" ]] && has_att="true"
             has_sbom="false"; [[ -f "${manifest_dir}/sha256-${digest_hex}.sbom" ]] && has_sbom="true"
@@ -623,9 +625,9 @@ regen_index_html() {
             [[ "$has_sig" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sig" "$blobs_dir")))
             [[ "$has_att" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.att" "$blobs_dir")))
             [[ "$has_sbom" == "true" ]] && size=$((size + $(manifest_total_size "${manifest_dir}/sha256-${digest_hex}.sbom" "$blobs_dir")))
-            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","config_digest":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
+            entries+=("$(printf '{"image":"%s","tag":"%s","digest":"%s","config_digest":"%s","media_type":"%s","platforms":"%s","blobs":%s,"size":%s,"mtime":"%s","signed":%s,"attested":%s,"sbom":%s}' \
                 "$(escape_json_string "$image_name")" "$(escape_json_string "$tag_name")" \
-                "$digest" "$(escape_json_string "$config_digest")" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
+                "$digest" "$(escape_json_string "$config_digest")" "$(escape_json_string "$media_type")" "$(escape_json_string "$platforms")" "$blob_count" "$size" "$mtime" \
                 "$has_sig" "$has_att" "$has_sbom")")
         done < <(list_manifest_entries "$manifest_dir")
     done < <(find "${root}/v2" -type d -name manifests 2>/dev/null | sort)
@@ -653,124 +655,152 @@ regen_index_html() {
 <title>Registry — Images disponibles</title>
 <style>
   :root {
-    --bg: #f5f6f8; --panel: #ffffff; --panel-alt: #fafbfc; --border: #e1e4ea; --border-soft: #eaecf1;
-    --text: #1a1d24; --text-dim: #5c6270; --text-faint: #8c92a0;
-    --accent: #2f6fed; --accent-dim: #eaf1ff;
-    --good: #16924f; --good-dim: #e6f7ec;
-    --hover: rgba(15,23,42,.035); --hover-strong: rgba(15,23,42,.05);
+    /* Palette calquée sur le thème sombre du container registry de GitLab. */
+    --bg: #18181b; --panel: #1f1f24; --panel-alt: #212127; --row-hover: #26262d;
+    --border: #35353d; --border-soft: #2a2a30;
+    --text: #f0f0f2; --text-dim: #9a9aa2; --text-faint: #6b6b73;
+    --accent: #6e9eff; --accent-dim: rgba(110,158,255,.14);
+    --brand: #fc6d26;
+    --good: #3ddb8f; --good-dim: rgba(61,219,143,.14);
+    --input-bg: #232329;
     --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
-    --radius: 10px;
+    --radius: 6px;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background:
-      radial-gradient(1100px 420px at 15% -10%, rgba(47,111,237,.06), transparent 60%),
-      var(--bg);
+    background: var(--bg);
     color: var(--text); padding: 1.75rem clamp(.85rem, 3vw, 2.25rem) 2.5rem;
     -webkit-font-smoothing: antialiased;
   }
   .page { max-width: 1080px; margin: 0 auto; }
-  header { margin-bottom: 1.1rem; }
-  h1 { font-size: 1.3rem; margin: 0 0 .25rem; display:flex; align-items:center; gap:.4rem; font-weight: 700; letter-spacing: -.01em; }
-  .subtitle { color: var(--text-dim); font-size: .78rem; }
+  header { margin-bottom: 1.1rem; display: flex; align-items: center; gap: .6rem; }
+  .brand-mark {
+    flex: 0 0 auto; width: 30px; height: 30px; border-radius: 8px;
+    background: linear-gradient(155deg, var(--brand), #e0451c);
+    display: flex; align-items: center; justify-content: center; font-size: .95rem;
+  }
+  h1 { font-size: 1.15rem; margin: 0; font-weight: 700; letter-spacing: -.01em; }
+  .subtitle { color: var(--text-faint); font-size: .74rem; margin-top: .15rem; }
 
-  .stats-bar {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
-    gap: .5rem; margin: 1rem 0;
+  .meta-line {
+    display: flex; flex-wrap: wrap; gap: .1rem .9rem; align-items: center;
+    color: var(--text-dim); font-size: .8rem; margin: 1rem 0 1.1rem; padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border-soft);
   }
-  .stat-tile {
-    background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
-    padding: .55rem .7rem; box-shadow: 0 1px 2px rgba(15,23,42,.04);
-  }
-  .stat-value { font-size: 1.1rem; font-weight: 700; line-height: 1.1; }
-  .stat-value.accent { color: var(--accent); }
-  .stat-value.good { color: var(--good); }
-  .stat-label { color: var(--text-dim); font-size: .68rem; margin-top: .1rem; text-transform: uppercase; letter-spacing: .03em; }
+  .meta-line strong { color: var(--text); font-weight: 600; }
+  .meta-line .good { color: var(--good); }
 
   .controls {
-    margin: 1rem 0 .85rem; display:flex; gap: .5rem; align-items:center; flex-wrap:wrap;
-    position: sticky; top: 0; padding: .5rem 0; background: linear-gradient(var(--bg) 78%, transparent); z-index: 5;
+    margin: 0 0 .85rem; display:flex; gap: .5rem; align-items:center; flex-wrap:wrap;
+    position: sticky; top: 0; padding: .5rem 0; background: linear-gradient(var(--bg) 82%, transparent); z-index: 5;
   }
   input[type="search"], select {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    padding: .45rem .7rem; border-radius: 8px; font-size: .82rem; outline: none;
+    background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
+    padding: .45rem .7rem; border-radius: 99px; font-size: .82rem; outline: none;
   }
   input[type="search"] { flex: 1 1 240px; min-width: 180px; }
   input[type="search"]:focus, select:focus, button:focus-visible { border-color: var(--accent); }
   select { flex: 0 0 auto; }
   button.btn {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text-dim);
-    padding: .45rem .7rem; border-radius: 8px; font-size: .78rem; cursor: pointer;
+    background: var(--input-bg); border: 1px solid var(--border); color: var(--text-dim);
+    padding: .45rem .8rem; border-radius: 99px; font-size: .78rem; cursor: pointer;
   }
   button.btn:hover { color: var(--text); border-color: var(--accent); }
-  .stat-inline { color: var(--text-dim); font-size: .76rem; margin-left: auto; white-space: nowrap; }
+  .stat-inline { color: var(--text-faint); font-size: .76rem; margin-left: auto; white-space: nowrap; }
 
-  .images { display: flex; flex-direction: column; gap: .5rem; }
+  .images { display: flex; flex-direction: column; gap: .6rem; }
   .image-card {
     background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius);
-    overflow: hidden; min-width: 0; box-shadow: 0 1px 2px rgba(15,23,42,.04);
-    /* min-width:0 évite qu'un flex-item ne s'élargisse au-delà du viewport à
-       cause du min-width de la table qu'il contient (le défaut flex
-       "min-width:auto" ignorerait sinon le overflow-x:auto de .table-scroll) */
+    overflow: hidden; min-width: 0;
   }
   .image-card-header {
-    display: flex; align-items: center; gap: .55rem; padding: .55rem .8rem; cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: .55rem; padding: .65rem .9rem; cursor: pointer; user-select: none;
   }
-  .image-card-header:hover { background: var(--hover); }
+  .image-card-header:hover { background: var(--row-hover); }
   .chevron { color: var(--text-faint); font-size: .65rem; transition: transform .15s ease; flex: 0 0 auto; }
   .image-card.collapsed .chevron { transform: rotate(-90deg); }
-  .image-name { font-weight: 600; font-size: .87rem; overflow-wrap: anywhere; }
+  .image-name { font-weight: 600; font-size: .9rem; overflow-wrap: anywhere; font-family: var(--mono); }
   .image-meta { display:flex; gap: .35rem; flex-wrap: wrap; margin-left: auto; padding-left: .85rem; }
   .image-card-body { border-top: 1px solid var(--border-soft); }
   .image-card.collapsed .image-card-body { display: none; }
-  .table-scroll {
-    overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+
+  /* Une ligne par groupe de tags (tags de contenu identique regroupés),
+     avec panneau de détail dépliable -- inspiré des lignes de tag du
+     container registry GitLab (nom, taille, digest court ; le détail
+     complet -- digest manifeste, media type, digest config -- n'apparaît
+     qu'au clic, plutôt que d'encombrer une table à colonnes fixes). */
+  .tag-item { border-top: 1px solid var(--border-soft); }
+  .tag-item:first-child { border-top: none; }
+  .tag-row {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem;
+    padding: .6rem .9rem; cursor: pointer; user-select: none;
   }
-  .table-scroll::-webkit-scrollbar { height: 6px; }
-  .table-scroll::-webkit-scrollbar-track { background: transparent; }
-  .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
-  .table-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
-  table { width: 100%; border-collapse: collapse; background: var(--panel-alt); min-width: 620px; }
-  th, td { text-align:left; padding: .4rem .8rem; border-bottom: 1px solid var(--border-soft); font-size: .78rem; white-space: nowrap; }
-  th { color: var(--text-faint); font-weight:600; font-size:.68rem; text-transform:uppercase; letter-spacing:.03em; }
-  tbody tr:last-child td { border-bottom:none; }
-  tbody tr:hover td { background: var(--hover); }
-  td.tags-cell { white-space: normal; }
+  .tag-row:hover { background: var(--row-hover); }
+  .tag-row-left { display: flex; gap: .5rem; min-width: 0; }
+  .tag-row-chevron { color: var(--text-faint); font-size: .62rem; flex: 0 0 auto; margin-top: .3rem; transition: transform .15s ease; }
+  .tag-item.expanded .tag-row-chevron { transform: rotate(90deg); }
+  .tag-row-main { min-width: 0; }
+  .tags-cell { display: flex; flex-wrap: wrap; }
+  .tag-row-sub { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .3rem; }
+  .tag-row-right { flex: 0 0 auto; text-align: right; }
+  .tag-row-size { color: var(--text-dim); font-size: .78rem; }
+  .tag-row-digest { margin-top: .3rem; }
+
+  .tag-details {
+    display: none; padding: .15rem .9rem .8rem 2.35rem; border-top: 1px dashed var(--border-soft);
+  }
+  .tag-item.expanded .tag-details { display: block; }
+  .detail-line { display: flex; gap: .6rem; align-items: baseline; padding: .2rem 0; font-size: .74rem; flex-wrap: wrap; }
+  .detail-label { color: var(--text-faint); flex: 0 0 auto; min-width: 9.5rem; }
+  .detail-value { font-family: var(--mono); color: var(--text-dim); word-break: break-all; flex: 1 1 200px; min-width: 0; }
+  .detail-value.plain { font-family: inherit; }
+
   .tag { display: inline-flex; align-items:center; gap:.25rem; font-family: var(--mono); background: var(--accent-dim); color: var(--accent);
          padding:.1rem .25rem .1rem .45rem; border-radius:6px; font-size:.74rem; margin: .08rem .2rem .08rem 0; white-space: nowrap; }
   .tag-copy { opacity: .55; cursor: pointer; padding: .05rem .25rem; border-radius: 4px; line-height:1; }
-  .tag-copy:hover { opacity: 1; background: rgba(47,111,237,.16); }
+  .tag-copy:hover { opacity: 1; background: rgba(110,158,255,.2); }
   .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; cursor: pointer; white-space: nowrap; }
   .digest::after { content: "⧉"; display: inline-block; opacity: 0; margin-left: .35rem; font-size: .82rem; transition: opacity .1s; }
   .digest:hover { color: var(--text); }
   .digest:hover::after { opacity: .8; }
   .digest.copied { color: var(--good); }
   .digest-none { font-family: var(--mono); color: var(--text-faint); font-size:.72rem; }
-  .badge { display:inline-block; background: var(--hover-strong); border:1px solid var(--border);
+  /* Dans le panneau de détail, le digest complet doit pouvoir se rompre sur
+     plusieurs lignes (contrairement au digest tronqué de l'en-tête de ligne,
+     volontairement sur une seule ligne) -- .digest fixe white-space:nowrap,
+     à annuler ici après coup pour que word-break:break-all agisse. */
+  .detail-value.digest { white-space: normal; }
+  .badge { display:inline-block; background: var(--panel-alt); border:1px solid var(--border);
            padding:.05rem .45rem; border-radius:99px; font-size:.68rem; margin:.08rem .2rem .08rem 0; color: var(--text-dim); }
-  .badge-cosign { background: var(--good-dim); border-color: #b7e6c9; color: var(--good); }
+  .badge-cosign { background: var(--good-dim); border-color: rgba(61,219,143,.35); color: var(--good); }
   .pill { display:inline-flex; align-items:center; gap:.25rem; font-size: .7rem; padding: .15rem .5rem; border-radius: 99px;
-          background: var(--hover-strong); border: 1px solid var(--border); color: var(--text-dim); white-space:nowrap; }
-  .pill-cosign { background: var(--good-dim); border-color: #b7e6c9; color: var(--good); }
+          background: var(--panel-alt); border: 1px solid var(--border); color: var(--text-dim); white-space:nowrap; }
+  .pill-cosign { background: var(--good-dim); border-color: rgba(61,219,143,.35); color: var(--good); }
   .empty { text-align:center; padding: 2.5rem 1rem; color: var(--text-dim); border: 1px dashed var(--border); border-radius: var(--radius); }
   footer { margin-top: 1.5rem; color: var(--text-faint); font-size:.72rem; text-align: center; }
-  ::selection { background: rgba(47,111,237,.22); }
+  ::selection { background: rgba(110,158,255,.28); }
   @media (max-width: 560px) {
     body { padding: 1.1rem .8rem 2rem; }
     .image-meta { padding-left: 0; margin-left: 0; width: 100%; }
     .image-card-header { flex-wrap: wrap; }
+    .tag-row { flex-wrap: wrap; }
+    .tag-row-right { text-align: left; }
+    .detail-label { min-width: 100%; }
   }
 </style>
 </head>
 <body>
 <div class="page">
 <header>
-  <h1>📦 Registry</h1>
-  <div class="subtitle">Générée hors-ligne le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</div>
+  <span class="brand-mark">📦</span>
+  <div>
+    <h1>Registry</h1>
+    <div class="subtitle">Générée hors-ligne le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</div>
+  </div>
 </header>
 
-<div class="stats-bar" id="stats-bar"></div>
+<div class="meta-line" id="stats-bar"></div>
 
 <div class="controls">
   <input type="search" id="search" placeholder="Filtrer par image, tag, digest ou architecture…">
@@ -798,6 +828,7 @@ HTML_PART1_EOF
     cat >> "$index_file" <<'HTML_PART2_EOF'
 
 const collapsed = new Set();
+const expandedRows = new Set();
 
 // Préfixe l'hôte:port depuis lequel cette page est effectivement consultée
 // (ex: "localhost:8000/"), pour que les références copiées soient directement
@@ -863,6 +894,7 @@ function groupByImage(rows) {
             tags: tags.map(t => t.tag).sort((a, b) => a.localeCompare(b)),
             digest: tags[0].digest,
             configDigest: tags[0].config_digest,
+            mediaType: tags[0].media_type,
             platforms: tags[0].platforms,
             blobs: tags[0].blobs,
             size: tags[0].size,
@@ -902,10 +934,10 @@ function renderStats() {
     const totalSize = REGISTRY_DATA.reduce((sum, r) => sum + r.size, 0);
 
     document.getElementById("stats-bar").innerHTML = `
-        <div class="stat-tile"><div class="stat-value">${nImages}</div><div class="stat-label">Image${nImages === 1 ? "" : "s"}</div></div>
-        <div class="stat-tile"><div class="stat-value">${nTags}</div><div class="stat-label">Tag${nTags === 1 ? "" : "s"}</div></div>
-        <div class="stat-tile"><div class="stat-value good">${nSigned}</div><div class="stat-label">Avec cosign</div></div>
-        <div class="stat-tile"><div class="stat-value accent">${humanSize(totalSize)}</div><div class="stat-label">Volume total</div></div>
+        <span><strong>${nImages}</strong> image${nImages === 1 ? "" : "s"}</span>
+        <span><strong>${nTags}</strong> tag${nTags === 1 ? "" : "s"}</span>
+        <span>${humanSize(totalSize)}</span>
+        <span class="${nSigned ? "good" : ""}">${nSigned ? "🔏 " : ""}${nSigned} avec cosign</span>
     `;
 }
 
@@ -919,6 +951,9 @@ function renderGroup(g) {
     ].join("");
 
     const rowsHtml = g.digestGroups.map(dg => {
+        const rowKey = g.image + "::" + dg.digest;
+        const isExpanded = expandedRows.has(rowKey);
+
         const tagBadges = dg.tags.map(t => {
             const label = t || "(sans tag)";
             // Sans tag, on ne peut pas référencer l'image par nom:tag -- on
@@ -935,23 +970,38 @@ function renderGroup(g) {
             dg.signed ? '<span class="badge badge-cosign" title="Signature cosign présente (sha256-&lt;digest&gt;.sig)">🔏 signé</span>' : '',
             dg.attested ? '<span class="badge badge-cosign" title="Attestation cosign présente (sha256-&lt;digest&gt;.att)">📎 attesté</span>' : '',
             dg.sbom ? '<span class="badge badge-cosign" title="SBOM présent (sha256-&lt;digest&gt;.sbom)">📄 SBOM</span>' : '',
-        ].join("") || '<span class="badge">—</span>';
+        ].join("");
 
-        const configCell = dg.configDigest
-            ? `<td class="digest" title="${dg.configDigest} (cliquer pour copier)" data-digest="${dg.configDigest}">${shortDigest(dg.configDigest)}</td>`
-            : `<td class="digest-none" title="Pas de config au niveau racine (manifest-list/index)">—</td>`;
+        // Panneau de détail, dans l'esprit du container registry GitLab :
+        // replié par défaut, il révèle le digest complet du manifeste, son
+        // media type, et le digest de la config -- plutôt que d'imposer ces
+        // trois colonnes en permanence dans la ligne.
+        const configLine = dg.configDigest
+            ? `<div class="detail-line"><span class="detail-label">Digest config</span><span class="digest detail-value" title="${dg.configDigest} (cliquer pour copier)" data-digest="${dg.configDigest}">${dg.configDigest}</span></div>`
+            : `<div class="detail-line"><span class="detail-label">Digest config</span><span class="detail-value plain">— (manifest-list/index, pas de config à ce niveau)</span></div>`;
 
         return `
-            <tr>
-                <td class="tags-cell">${tagBadges}</td>
-                <td>${platformBadges}</td>
-                <td class="digest" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${shortDigest(dg.digest)}</td>
-                ${configCell}
-                <td>${cosignBadges}</td>
-                <td>${dg.blobs}</td>
-                <td>${humanSize(dg.size)}</td>
-                <td>${humanDate(dg.mtime)}</td>
-            </tr>`;
+            <div class="tag-item${isExpanded ? " expanded" : ""}" data-row-toggle="${escapeHtml(rowKey)}">
+                <div class="tag-row">
+                    <div class="tag-row-left">
+                        <span class="tag-row-chevron">▸</span>
+                        <div class="tag-row-main">
+                            <div class="tags-cell">${tagBadges}</div>
+                            <div class="tag-row-sub">${platformBadges}${cosignBadges}</div>
+                        </div>
+                    </div>
+                    <div class="tag-row-right">
+                        <div class="tag-row-size">${humanSize(dg.size)} · ${humanDate(dg.mtime)}</div>
+                        <div class="tag-row-digest digest" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${shortDigest(dg.digest)}</div>
+                    </div>
+                </div>
+                <div class="tag-details">
+                    <div class="detail-line"><span class="detail-label">Digest manifeste</span><span class="digest detail-value" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${dg.digest}</span></div>
+                    <div class="detail-line"><span class="detail-label">Media type</span><span class="detail-value plain">${escapeHtml(dg.mediaType || "?")}</span></div>
+                    ${configLine}
+                    <div class="detail-line"><span class="detail-label">Blobs</span><span class="detail-value plain">${dg.blobs}</span></div>
+                </div>
+            </div>`;
     }).join("");
 
     const card = document.createElement("div");
@@ -962,25 +1012,7 @@ function renderGroup(g) {
             <span class="image-name">${escapeHtml(g.image)}</span>
             <span class="image-meta">${metaPills}</span>
         </div>
-        <div class="image-card-body">
-            <div class="table-scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Tag(s)</th>
-                            <th>Architecture(s)</th>
-                            <th>Digest (manifest)</th>
-                            <th>Digest (config)</th>
-                            <th>Cosign</th>
-                            <th>Blobs</th>
-                            <th>Taille</th>
-                            <th>Modifié</th>
-                        </tr>
-                    </thead>
-                    <tbody>${rowsHtml}</tbody>
-                </table>
-            </div>
-        </div>
+        <div class="image-card-body">${rowsHtml}</div>
     `;
     return card;
 }
@@ -1038,8 +1070,14 @@ document.getElementById("images").addEventListener("click", (e) => {
     }
     const tagCopy = e.target.closest(".tag-copy");
     if (tagCopy) {
-        e.stopPropagation();
         copyToClipboard(tagCopy.dataset.copy, tagCopy, "✓");
+        return;
+    }
+    const rowToggle = e.target.closest("[data-row-toggle]");
+    if (rowToggle) {
+        const key = rowToggle.dataset.rowToggle;
+        if (expandedRows.has(key)) { expandedRows.delete(key); rowToggle.classList.remove("expanded"); }
+        else { expandedRows.add(key); rowToggle.classList.add("expanded"); }
     }
 });
 
