@@ -147,6 +147,45 @@ load 'test_helper'
     grep -q "^v2/myimage/manifests/sha256-${ref2_digest}\$" listing.txt
 }
 
+@test "pull --with-signatures : un tag 'sha256-<digest>' qui n'est PAS un index de referrers (alias vers le même manifeste, cas réel registry.access.redhat.com) ne doit pas masquer l'image réelle" {
+    cd "$BATS_TEST_TMPDIR"
+    local fakebin="${BATS_TEST_TMPDIR}/fakebin"
+    install_fake_skopeo "$fakebin"
+
+    build_skopeo_dir "main-src" > /dev/null
+    local digest_hex; digest_hex="$(sha256sum main-src/manifest.json | cut -d' ' -f1)"
+
+    # Cas réel observé sur registry.access.redhat.com : le tag "sha256-<digest>"
+    # existe mais n'est PAS un index de referrers OCI 1.1 -- c'est un simple
+    # alias qui renvoie EXACTEMENT le même contenu que le manifeste de l'image
+    # (donc le même digest que digest_hex), sans rapport avec cosign/SBOM.
+    local map="${BATS_TEST_TMPDIR}/skopeo-map.tsv"
+    {
+        printf '@sha256:%s\t%s\n' "$digest_hex" "${BATS_TEST_TMPDIR}/main-src"
+        printf '.sig\tFAIL\n'
+        printf '.att\tFAIL\n'
+        printf '.sbom\tFAIL\n'
+        printf ':sha256-%s\t%s\n' "$digest_hex" "${BATS_TEST_TMPDIR}/main-src"
+    } > "$map"
+
+    PATH="${fakebin}:${PATH}" FAKE_SKOPEO_MAP="$map" \
+        "$REGISTRY_CLI" pull -i myimage --digest "sha256:${digest_hex}" \
+        --with-signatures -o out.tar.gz --no-expand >/dev/null
+
+    local root="${BATS_TEST_TMPDIR}/registry"
+    "$REGISTRY_CLI" upload -a out.tar.gz -r "$root" >/dev/null
+
+    run "$REGISTRY_CLI" list -r "$root" --json
+    [ "$status" -eq 0 ]
+    local n
+    n="$(echo "$output" | jq 'length')"
+    # L'image réelle doit rester visible (pas 0 entrée : c'était le bug --
+    # son digest, identique à celui de l'alias, la faisait classer comme
+    # "compagnon cosign" et donc masquer entièrement).
+    [ "$n" -eq 1 ]
+    echo "$output" | jq -e --arg d "sha256:${digest_hex}" '.[0].digest == $d' >/dev/null
+}
+
 @test "pull --with-signatures sur un pull par digest seul : les artefacts cosign n'apparaissent jamais comme de fausses images dans list/index" {
     cd "$BATS_TEST_TMPDIR"
     local fakebin="${BATS_TEST_TMPDIR}/fakebin"

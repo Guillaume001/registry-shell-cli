@@ -413,6 +413,20 @@ pull_oci_referrers_fallback() {
     skopeo copy "${source_ref}:${referrers_tag}" "dir:${referrers_dir}" \
         >"${referrers_dir}.log" 2>&1 || return 1
 
+    # Certaines registries (constaté sur registry.access.redhat.com) ont un
+    # tag "sha256-<digest>" qui n'a RIEN à voir avec la convention de repli
+    # OCI 1.1 : c'est un simple alias qui renvoie le manifeste de l'image
+    # elle-même, à l'identique (même digest que digest_hex). Le traiter comme
+    # un index de referrers masquerait alors l'image réelle -- son digest
+    # serait classé "compagnon cosign" et donc exclu de list/index. Un vrai
+    # index de referrers est un document DIFFÉRENT de l'image (liste de
+    # manifestes sig/att/sbom qui la référencent), jamais identique à elle.
+    local referrers_digest
+    referrers_digest="$(sha256sum "${referrers_dir}/manifest.json" | cut -d' ' -f1)"
+    if [[ "$referrers_digest" == "$digest_hex" ]]; then
+        return 1
+    fi
+
     # Tag "compagnon" (forme nue sha256-<digest>, reconnue par
     # is_cosign_companion_tag) plutôt que tag="" : sans ça, ce manifeste
     # n'existerait que sous son nom canonique manifests/sha256:xxx, exactement
