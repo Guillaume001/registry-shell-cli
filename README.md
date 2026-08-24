@@ -559,6 +559,12 @@ registry-cli.sh remove -r /srv/registrish --image alpine --tag 3.19   # ancienne
   récupération récursive d'un niveau des manifestes qu'il référence). Si
   votre registry source pousse les signatures autrement (API Referrers
   dynamique sans tag de repli, par exemple), elles ne seront pas trouvées.
+  Vérifié en conditions réelles contre `registry.access.redhat.com` :
+  cette registry a un tag `sha256-<digest>` qui n'a rien à voir avec la
+  convention "referrers" (c'est un simple alias renvoyant le manifeste de
+  l'image telle quelle) — le script détecte ce cas (même digest que
+  l'image) et l'ignore, pour ne pas masquer l'image réelle dans
+  `list`/`index`.
 - **`verify`/`sbom` nécessitent un registre HTTP réellement accessible** :
   contrairement au reste de l'outil, ces deux commandes ne sont pas
   offline — `cosign` doit pouvoir joindre `REGISTRY_URL` en HTTP(S) au
