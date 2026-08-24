@@ -78,3 +78,54 @@ setup() {
     grep -q "ForceType application/vnd.docker.distribution.manifest.v1+prettyjws" \
         "${ROOT}/v2/myimage/manifests/.htaccess"
 }
+
+# --- Régression : "unsupported schema version 2" chez podman/docker -------
+# Un manifeste OCI schemaVersion:2 peut légitimement omettre "mediaType" (le
+# protocole OCI Distribution prévoit que le Content-Type HTTP le porte à sa
+# place). Avant ce correctif, l'absence de "mediaType" retombait TOUJOURS
+# sur le Content-Type schema1 (v1+prettyjws), ce qui fait mentir Apache sur
+# le format réel du manifeste et casse le pull côté client : podman/docker
+# refusent alors le contenu avec "unsupported schema version 2".
+
+@test "guess_media_type_for_missing_field: manifeste OCI schemaVersion:2 (config+layers) sans mediaType" {
+    local f="${BATS_TEST_TMPDIR}/manifest-no-mediatype.json"
+    echo '{"schemaVersion":2,"config":{"digest":"sha256:aaaa","size":10},"layers":[{"digest":"sha256:bbbb","size":20}]}' > "$f"
+    run guess_media_type_for_missing_field "$f"
+    [ "$output" = "application/vnd.oci.image.manifest.v1+json" ]
+}
+
+@test "guess_media_type_for_missing_field: index/manifest-list schemaVersion:2 sans mediaType" {
+    local f="${BATS_TEST_TMPDIR}/index-no-mediatype.json"
+    echo '{"schemaVersion":2,"manifests":[{"digest":"sha256:cccc","size":10}]}' > "$f"
+    run guess_media_type_for_missing_field "$f"
+    [ "$output" = "application/vnd.oci.image.index.v1+json" ]
+}
+
+@test "guess_media_type_for_missing_field: schemaVersion:1 (schema1 historique) reste v1+prettyjws" {
+    local f="${BATS_TEST_TMPDIR}/schema1.json"
+    echo '{"schemaVersion":1,"name":"foo"}' > "$f"
+    run guess_media_type_for_missing_field "$f"
+    [ "$output" = "application/vnd.docker.distribution.manifest.v1+prettyjws" ]
+}
+
+@test "guess_media_type_for_missing_field: repli grep/sed identique à jq (jq masqué)" {
+    local f="${BATS_TEST_TMPDIR}/manifest-no-mediatype.json"
+    echo '{"schemaVersion":2,"config":{"digest":"sha256:aaaa","size":10},"layers":[{"digest":"sha256:bbbb","size":20}]}' > "$f"
+    command() {
+        if [[ "$1" == "-v" && "$2" == "jq" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    run guess_media_type_for_missing_field "$f"
+    [ "$output" = "application/vnd.oci.image.manifest.v1+json" ]
+}
+
+@test "regen_apache2_config: manifeste OCI schemaVersion:2 sans mediaType obtient le bon ForceType (pas v1+prettyjws)" {
+    mkdir -p "${ROOT}/v2/myimage/manifests" "${ROOT}/v2/myimage/blobs"
+    echo '{"schemaVersion":2,"config":{"digest":"sha256:aaaa","size":10},"layers":[{"digest":"sha256:bbbb","size":20}]}' \
+        > "${ROOT}/v2/myimage/manifests/3.20"
+
+    regen_apache2_config "$ROOT"
+
+    grep -q "ForceType application/vnd.oci.image.manifest.v1+json" "${ROOT}/v2/myimage/manifests/.htaccess"
+    ! grep -q "v1+prettyjws" "${ROOT}/v2/myimage/manifests/.htaccess"
+}

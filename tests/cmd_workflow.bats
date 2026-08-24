@@ -73,6 +73,29 @@ setup() {
     echo "$output" | jq -e '.[0].image == "alpine" and .[0].tag == "3.20"' >/dev/null
 }
 
+@test "list --json: 'size' est la taille TOTALE de l'image (manifeste + blobs), pas juste le manifeste" {
+    "$REGISTRY_CLI" upload -a alpine.tar.gz -r "$REGISTRY_ROOT" >/dev/null
+    local manifest_bytes
+    manifest_bytes="$(stat -c%s "${REGISTRY_ROOT}/v2/alpine/manifests/3.20" 2>/dev/null || stat -f%z "${REGISTRY_ROOT}/v2/alpine/manifests/3.20")"
+
+    run "$REGISTRY_CLI" list -r "$REGISTRY_ROOT" --json
+    [ "$status" -eq 0 ]
+    local reported_size
+    reported_size="$(echo "$output" | jq '.[0].size')"
+    [ "$reported_size" -gt "$manifest_bytes" ]
+    # Le champ s'appelle "size" (le nom "manifest_size" induisait en erreur :
+    # ce n'est plus seulement la taille du manifeste).
+    echo "$output" | jq -e '.[0] | has("manifest_size") | not' >/dev/null
+}
+
+@test "list (texte): l'en-tête de colonne est SIZE, pas MANIFEST_SIZE" {
+    "$REGISTRY_CLI" upload -a alpine.tar.gz -r "$REGISTRY_ROOT" >/dev/null
+    run "$REGISTRY_CLI" list -r "$REGISTRY_ROOT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SIZE"* ]]
+    [[ "$output" != *"MANIFEST_SIZE"* ]]
+}
+
 @test "list: registry sans v2/ est une erreur" {
     mkdir -p "$REGISTRY_ROOT"
     run "$REGISTRY_CLI" list -r "$REGISTRY_ROOT"

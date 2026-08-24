@@ -231,7 +231,9 @@ registry-cli.sh list -r REGISTRY_ROOT [--json]
 
 Affiche, pour chaque image/tag : image, tag, digest, présence
 signature/attestation/SBOM cosign (colonne `COSIGN`, ex: `sig,att`), nombre
-de blobs, taille du manifeste, date de dernière modification. Les artefacts
+de blobs, **taille totale de l'image** (manifeste + tous les blobs qu'il
+référence + artefacts cosign présents, PAS juste le petit fichier JSON du
+manifeste), date de dernière modification. Les artefacts
 cosign eux-mêmes — tags compagnons (`sha256-<digest>.sig`/`.att`/`.sbom`,
 tag de repli `sha256-<digest>`), **et leurs éventuelles copies canoniques
 `manifests/sha256:xxx`**, y compris pour chaque entrée référencée par le
