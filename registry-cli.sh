@@ -653,6 +653,7 @@ regen_index_html() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Registry — Images disponibles</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%93%A6</text></svg>">
 <style>
   :root {
     /* Thème clair par défaut. */
@@ -839,7 +840,7 @@ regen_index_html() {
 
 <div class="images" id="images"></div>
 <div class="empty" id="empty-state" style="display:none;">Aucune image ne correspond à ce filtre.</div>
-<footer>Généré le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</footer>
+<footer>Généré le @@GENERATED_AT@@ par registry-cli.sh</footer>
 </div>
 <script>
 const REGISTRY_DATA =
