@@ -18,6 +18,13 @@ setup() {
     grep -q "MANIFEST_UNKNOWN" "${ROOT}/v2/error.json"
 }
 
+@test "regen_apache2_config: affiche un rappel sur AllowOverride (indispensable pour que .htaccess soit pris en compte)" {
+    run regen_apache2_config "$ROOT"
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -qi "AllowOverride"
+    echo "$output" | grep -q "unsupported schema version 2"
+}
+
 @test "regen_apache2_config: ForceType par mediaType sur les fichiers de manifests/" {
     local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
     build_skopeo_dir "$skopeo_dir" > /dev/null

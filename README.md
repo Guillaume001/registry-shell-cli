@@ -295,20 +295,34 @@ registry-cli.sh index -r REGISTRY_ROOT
 
 Génère `REGISTRY_ROOT/index.html` : un tableau de bord statique et
 **entièrement autonome** (CSS/JS inline, aucune ressource externe, aucun
-CDN), organisé **par image** plutôt qu'en table plate : chaque image est une
-carte repliable regroupant tous ses tags, et à l'intérieur d'une carte, les
-tags qui pointent vers un **contenu identique** (ex: `latest` et `3.21`
-poussés sur le même digest) sont affichés sur une seule ligne au lieu
-d'être dupliqués. Chaque ligne montre architecture(s), digest, badges
-cosign, nombre de blobs, taille et date de modification.
+CDN), au design inspiré du container registry de GitLab, organisé
+**par image** plutôt qu'en table plate : chaque image est une carte
+repliable regroupant tous ses tags, et à l'intérieur d'une carte, les tags
+qui pointent vers un **contenu identique** (ex: `latest` et `3.21` poussés
+sur le même digest) sont affichés sur une seule ligne au lieu d'être
+dupliqués. Chaque ligne (repliée par défaut, comme sur GitLab) montre
+tag(s), architecture(s), badges cosign, taille et date de publication
+relative (« Publié il y a X », date absolue en info-bulle) — le digest
+n'apparaît pas à ce niveau ; cliquer sur la ligne déplie un panneau de
+détail avec le digest complet du **manifeste** (bouton ⧉ dédié pour le
+copier), son **media type**, le digest de la **config** (le blob
+`config.json` référencé — absent pour une manifest-list/index, qui n'a pas
+de config à son propre niveau), le nombre de blobs, et — quand présents —
+des lignes explicites pour la **signature**, l'**attestation** et le
+**SBOM** cosign (convention `sha256-<digest>.{sig,att,sbom}`).
 
-Une barre de statistiques en tête (nombre d'images, de tags, d'images
-signées/attestées, volume total) donne une vue d'ensemble immédiate.
-Recherche et tri (nom, nombre de tags, taille, date) se font côté client en
-JavaScript pur ; un bouton reploie/déplie toutes les cartes d'un coup, et
-chaque carte individuellement au clic sur son en-tête. Cliquer sur un
-digest, ou sur l'icône ⧉ à côté d'un tag, le copie dans le presse-papier
-(`image:tag` pour un tag, le digest complet sinon).
+La page s'adapte au thème clair/sombre du système, et un bouton 🌓 dans
+l'en-tête permet de forcer l'un ou l'autre (mémorisé dans le navigateur).
+Une ligne de statistiques en tête (📦 images, 🏷️ tags, 💾 volume total,
+🔏 images avec cosign) donne une vue d'ensemble immédiate. Recherche et tri
+(nom, nombre de tags, taille, date) se font côté client en JavaScript pur ;
+un bouton reploie/déplie toutes les cartes d'un coup, et chaque carte
+individuellement au clic sur son en-tête. Cliquer sur le bouton ⧉ à côté
+d'un digest, ou sur l'icône ⧉ à côté d'un tag, le copie dans le
+presse-papier — préfixé par l'hôte:port qui sert effectivement la page
+(ex. `localhost:8000/alpine:3.20`, ou `localhost:8000/ubi10@sha256:...`
+pour une image sans tag), donc directement utilisable avec
+`podman`/`docker pull`.
 
 L'architecture est détectée automatiquement :
 - pour une **manifest-list** (multi-arch), depuis les champs
@@ -447,6 +461,51 @@ REGISTRY_ROOT/
             └── sha256:<digest>     # config JSON + layers (pas de .htaccess)
 ```
 
+## Servir la registry avec Apache2
+
+Le protocole registry v2 a besoin que chaque manifeste soit servi avec le
+bon `Content-Type` (schéma 1 vs schéma 2/OCI) et l'en-tête
+`Docker-Content-Digest`. Comme il n'y a pas de serveur applicatif ici, ce
+script s'appuie entièrement sur des fichiers `.htaccess` (`ForceType`,
+`Header add`) déposés dans chaque répertoire `manifests/`.
+
+**Pour que ces `.htaccess` soient pris en compte, Apache doit avoir
+`AllowOverride All` (ou au moins `FileInfo`) sur le répertoire servi.**
+Ce n'est **pas** le réglage par défaut de l'image officielle
+`httpd:2.4` (son `httpd.conf` a `AllowOverride None`) : sans ce réglage,
+Apache ignore silencieusement tous les `.htaccess` — aucun `Content-Type`
+ni `Docker-Content-Digest` n'est envoyé, et `podman`/`docker pull` échoue
+typiquement avec `unsupported schema version 2` (schéma 2 lu comme
+schéma 1faute de `Content-Type`).
+
+Pour tester rapidement avec l'image officielle telle quelle, ajoutez les
+options `-c` qui activent `AllowOverride All` au démarrage, sans fichier
+de config supplémentaire :
+
+```bash
+podman run -dit --name my-apache-app -p 8000:80 \
+    -v "$PWD":/usr/local/apache2/htdocs/ \
+    docker.io/library/httpd:2.4 \
+    httpd-foreground \
+    -c "<Directory /usr/local/apache2/htdocs>" \
+    -c "AllowOverride All" \
+    -c "</Directory>"
+```
+
+(remplacez `podman` par `docker` au besoin ; la syntaxe est identique).
+Vérification rapide une fois le conteneur démarré :
+
+```bash
+curl -sI http://localhost:8000/v2/<image>/manifests/<tag>
+# doit contenir Content-Type: application/vnd.oci.image.manifest.v1+json
+# (ou +prettyjws pour du schéma 1) et Docker-Content-Digest: sha256:...
+# Si ces deux en-têtes sont absents, .htaccess n'est pas honoré.
+```
+
+En production, préférez une image Apache dédiée (Dockerfile avec
+`AllowOverride All` dans un vhost, ou config équivalente sur un Apache
+"nu") plutôt que ces `-c` en ligne de commande.
+
 ## Workflows type
 
 **Signature et vérification GPG de bout en bout :**
@@ -514,6 +573,12 @@ registry-cli.sh remove -r /srv/registrish --image alpine --tag 3.19   # ancienne
   récupération récursive d'un niveau des manifestes qu'il référence). Si
   votre registry source pousse les signatures autrement (API Referrers
   dynamique sans tag de repli, par exemple), elles ne seront pas trouvées.
+  Vérifié en conditions réelles contre `registry.access.redhat.com` :
+  cette registry a un tag `sha256-<digest>` qui n'a rien à voir avec la
+  convention "referrers" (c'est un simple alias renvoyant le manifeste de
+  l'image telle quelle) — le script détecte ce cas (même digest que
+  l'image) et l'ignore, pour ne pas masquer l'image réelle dans
+  `list`/`index`.
 - **`verify`/`sbom` nécessitent un registre HTTP réellement accessible** :
   contrairement au reste de l'outil, ces deux commandes ne sont pas
   offline — `cosign` doit pouvoir joindre `REGISTRY_URL` en HTTP(S) au

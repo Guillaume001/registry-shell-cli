@@ -99,6 +99,39 @@ JSON
     ! grep -q '@@GENERATED_AT@@' "${ROOT}/index.html"
 }
 
+@test "regen_index_html: expose le digest de la config (blob config référencé par le manifeste), en plus du digest du manifeste" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    local digests config_digest
+    digests="$(build_skopeo_dir "$skopeo_dir")"
+    read -r config_digest _ <<< "$digests"
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    grep -q "\"config_digest\":\"sha256:${config_digest}\"" "${ROOT}/index.html"
+}
+
+@test "regen_index_html: expose le media type du manifeste" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    grep -q '"media_type":"application/vnd.docker.distribution.manifest.v2+json"' "${ROOT}/index.html"
+}
+
+@test "regen_index_html: manifest-list (pas de config au niveau racine) -> config_digest vide" {
+    local manifest_dir="${ROOT}/v2/myimage/manifests"
+    mkdir -p "$manifest_dir" "${ROOT}/v2/myimage/blobs"
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:aaaa000000000000000000000000000000000000000000000000000000000","platform":{"architecture":"amd64","os":"linux"}}]}' \
+        > "${manifest_dir}/multi"
+
+    regen_index_html "$ROOT"
+
+    grep -q '"config_digest":""' "${ROOT}/index.html"
+}
+
 @test "regen_index_html: registry vide -> tableau JSON vide, page toujours valide" {
     mkdir -p "${ROOT}/v2"
     regen_index_html "$ROOT"
@@ -122,6 +155,20 @@ JSON
     grep -q 'id="sort-mode"' "${ROOT}/index.html"
     grep -q 'id="toggle-all"' "${ROOT}/index.html"
     grep -q 'function groupByImage' "${ROOT}/index.html"
+}
+
+@test "regen_index_html: le JS préfixe la copie par l'hôte servant la page, et utilise @sha256:... quand il n'y a pas de tag" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    grep -q 'const HOST_PREFIX' "${ROOT}/index.html"
+    grep -q 'location.host' "${ROOT}/index.html"
+    # Avec tag : HOST_PREFIX + image:tag. Sans tag : HOST_PREFIX + image@digest.
+    grep -q '\${HOST_PREFIX}\${g.image}:\${t}' "${ROOT}/index.html"
+    grep -q '\${HOST_PREFIX}\${g.image}@\${dg.digest}' "${ROOT}/index.html"
 }
 
 @test "regen_index_html: deux tags de contenu identique restent deux entrées JSON distinctes (le regroupement est côté JS)" {
