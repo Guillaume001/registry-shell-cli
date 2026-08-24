@@ -741,8 +741,10 @@ regen_index_html() {
          padding:.1rem .25rem .1rem .45rem; border-radius:6px; font-size:.74rem; margin: .08rem .2rem .08rem 0; white-space: nowrap; }
   .tag-copy { opacity: .55; cursor: pointer; padding: .05rem .25rem; border-radius: 4px; line-height:1; }
   .tag-copy:hover { opacity: 1; background: rgba(47,111,237,.16); }
-  .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; cursor: pointer; }
-  .digest:hover { color: var(--text); text-decoration: underline dotted; }
+  .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; cursor: pointer; white-space: nowrap; }
+  .digest::after { content: "⧉"; display: inline-block; opacity: 0; margin-left: .35rem; font-size: .82rem; transition: opacity .1s; }
+  .digest:hover { color: var(--text); }
+  .digest:hover::after { opacity: .8; }
   .digest.copied { color: var(--good); }
   .digest-none { font-family: var(--mono); color: var(--text-faint); font-size:.72rem; }
   .badge { display:inline-block; background: var(--hover-strong); border:1px solid var(--border);
@@ -796,6 +798,14 @@ HTML_PART1_EOF
     cat >> "$index_file" <<'HTML_PART2_EOF'
 
 const collapsed = new Set();
+
+// Préfixe l'hôte:port depuis lequel cette page est effectivement consultée
+// (ex: "localhost:8000/"), pour que les références copiées soient directement
+// utilisables en l'état (podman/docker pull, etc.). Vide si la page est
+// ouverte en local (file://) plutôt que servie par le même Apache2 que la
+// registry -- dans ce cas on ne peut pas deviner l'hôte réel de la registry.
+const HOST_PREFIX = (location.protocol === "http:" || location.protocol === "https:") && location.host
+    ? location.host + "/" : "";
 
 function humanSize(bytes) {
     if (bytes < 1024) return bytes + " o";
@@ -911,7 +921,10 @@ function renderGroup(g) {
     const rowsHtml = g.digestGroups.map(dg => {
         const tagBadges = dg.tags.map(t => {
             const label = t || "(sans tag)";
-            const copyPayload = t ? `${g.image}:${t}` : g.image;
+            // Sans tag, on ne peut pas référencer l'image par nom:tag -- on
+            // copie donc une référence par digest ("image@sha256:...", seule
+            // forme utilisable par podman/docker pull dans ce cas).
+            const copyPayload = t ? `${HOST_PREFIX}${g.image}:${t}` : `${HOST_PREFIX}${g.image}@${dg.digest}`;
             return `<span class="tag">${escapeHtml(label)}<span class="tag-copy" data-copy="${escapeHtml(copyPayload)}" title="Copier « ${escapeHtml(copyPayload)} »">⧉</span></span>`;
         }).join("");
 

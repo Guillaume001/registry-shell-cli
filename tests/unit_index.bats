@@ -147,6 +147,20 @@ JSON
     grep -q 'function groupByImage' "${ROOT}/index.html"
 }
 
+@test "regen_index_html: le JS préfixe la copie par l'hôte servant la page, et utilise @sha256:... quand il n'y a pas de tag" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_index_html "$ROOT"
+
+    grep -q 'const HOST_PREFIX' "${ROOT}/index.html"
+    grep -q 'location.host' "${ROOT}/index.html"
+    # Avec tag : HOST_PREFIX + image:tag. Sans tag : HOST_PREFIX + image@digest.
+    grep -q '\${HOST_PREFIX}\${g.image}:\${t}' "${ROOT}/index.html"
+    grep -q '\${HOST_PREFIX}\${g.image}@\${dg.digest}' "${ROOT}/index.html"
+}
+
 @test "regen_index_html: deux tags de contenu identique restent deux entrées JSON distinctes (le regroupement est côté JS)" {
     local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
     build_skopeo_dir "$skopeo_dir" > /dev/null
