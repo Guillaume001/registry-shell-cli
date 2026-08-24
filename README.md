@@ -295,24 +295,30 @@ registry-cli.sh index -r REGISTRY_ROOT
 
 Génère `REGISTRY_ROOT/index.html` : un tableau de bord statique et
 **entièrement autonome** (CSS/JS inline, aucune ressource externe, aucun
-CDN), au thème sombre inspiré du container registry de GitLab, organisé
+CDN), au design inspiré du container registry de GitLab, organisé
 **par image** plutôt qu'en table plate : chaque image est une carte
 repliable regroupant tous ses tags, et à l'intérieur d'une carte, les tags
 qui pointent vers un **contenu identique** (ex: `latest` et `3.21` poussés
 sur le même digest) sont affichés sur une seule ligne au lieu d'être
 dupliqués. Chaque ligne (repliée par défaut, comme sur GitLab) montre
-tag(s), architecture(s), badges cosign, taille et digest du manifeste
-tronqué ; cliquer dessus déplie un panneau de détail avec le digest complet
-du **manifeste**, son **media type**, le digest de la **config** (le blob
+tag(s), architecture(s), badges cosign, taille et date de publication
+relative (« Publié il y a X », date absolue en info-bulle) — le digest
+n'apparaît pas à ce niveau ; cliquer sur la ligne déplie un panneau de
+détail avec le digest complet du **manifeste** (bouton ⧉ dédié pour le
+copier), son **media type**, le digest de la **config** (le blob
 `config.json` référencé — absent pour une manifest-list/index, qui n'a pas
-de config à son propre niveau) et le nombre de blobs.
+de config à son propre niveau), le nombre de blobs, et — quand présents —
+des lignes explicites pour la **signature**, l'**attestation** et le
+**SBOM** cosign (convention `sha256-<digest>.{sig,att,sbom}`).
 
-Une ligne de statistiques en tête (nombre d'images, de tags, volume total,
-images avec cosign) donne une vue d'ensemble immédiate. Recherche et tri
+La page s'adapte au thème clair/sombre du système, et un bouton 🌓 dans
+l'en-tête permet de forcer l'un ou l'autre (mémorisé dans le navigateur).
+Une ligne de statistiques en tête (📦 images, 🏷️ tags, 💾 volume total,
+🔏 images avec cosign) donne une vue d'ensemble immédiate. Recherche et tri
 (nom, nombre de tags, taille, date) se font côté client en JavaScript pur ;
 un bouton reploie/déplie toutes les cartes d'un coup, et chaque carte
-individuellement au clic sur son en-tête. Cliquer sur un digest (manifeste
-ou config), ou sur l'icône ⧉ à côté d'un tag, le copie dans le
+individuellement au clic sur son en-tête. Cliquer sur le bouton ⧉ à côté
+d'un digest, ou sur l'icône ⧉ à côté d'un tag, le copie dans le
 presse-papier — préfixé par l'hôte:port qui sert effectivement la page
 (ex. `localhost:8000/alpine:3.20`, ou `localhost:8000/ubi10@sha256:...`
 pour une image sans tag), donc directement utilisable avec

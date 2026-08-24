@@ -655,16 +655,38 @@ regen_index_html() {
 <title>Registry — Images disponibles</title>
 <style>
   :root {
-    /* Palette calquée sur le thème sombre du container registry de GitLab. */
+    /* Thème clair par défaut. */
+    --bg: #f4f4f6; --panel: #ffffff; --panel-alt: #f1f1f4; --row-hover: #f0f2f7;
+    --border: #dedee3; --border-soft: #e7e7ea;
+    --text: #1b1b1e; --text-dim: #5c5c64; --text-faint: #8a8a92;
+    --accent: #3568d4; --accent-dim: rgba(53,104,212,.10);
+    --brand: #fc6d26;
+    --good: #1a9c62; --good-dim: rgba(26,156,98,.12);
+    --input-bg: #ffffff;
+    --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+    --radius: 6px;
+  }
+  /* Thème sombre, calqué sur le container registry de GitLab : appliqué
+     automatiquement si le système est en sombre (sauf choix explicite
+     "clair" mémorisé), ou si l'utilisateur a explicitement choisi "sombre"
+     via le bouton de bascule (voir #theme-toggle). */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #18181b; --panel: #1f1f24; --panel-alt: #212127; --row-hover: #26262d;
+      --border: #35353d; --border-soft: #2a2a30;
+      --text: #f0f0f2; --text-dim: #9a9aa2; --text-faint: #6b6b73;
+      --accent: #6e9eff; --accent-dim: rgba(110,158,255,.14);
+      --good: #3ddb8f; --good-dim: rgba(61,219,143,.14);
+      --input-bg: #232329;
+    }
+  }
+  :root[data-theme="dark"] {
     --bg: #18181b; --panel: #1f1f24; --panel-alt: #212127; --row-hover: #26262d;
     --border: #35353d; --border-soft: #2a2a30;
     --text: #f0f0f2; --text-dim: #9a9aa2; --text-faint: #6b6b73;
     --accent: #6e9eff; --accent-dim: rgba(110,158,255,.14);
-    --brand: #fc6d26;
     --good: #3ddb8f; --good-dim: rgba(61,219,143,.14);
     --input-bg: #232329;
-    --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
-    --radius: 6px;
   }
   * { box-sizing: border-box; }
   body {
@@ -674,20 +696,22 @@ regen_index_html() {
     -webkit-font-smoothing: antialiased;
   }
   .page { max-width: 1080px; margin: 0 auto; }
-  header { margin-bottom: 1.1rem; display: flex; align-items: center; gap: .6rem; }
-  .brand-mark {
-    flex: 0 0 auto; width: 30px; height: 30px; border-radius: 8px;
-    background: linear-gradient(155deg, var(--brand), #e0451c);
-    display: flex; align-items: center; justify-content: center; font-size: .95rem;
-  }
+  header { margin-bottom: 1.1rem; display: flex; align-items: center; gap: .55rem; }
+  .brand-mark { flex: 0 0 auto; font-size: 1.5rem; line-height: 1; }
   h1 { font-size: 1.15rem; margin: 0; font-weight: 700; letter-spacing: -.01em; }
-  .subtitle { color: var(--text-faint); font-size: .74rem; margin-top: .15rem; }
+  .theme-toggle {
+    margin-left: auto; flex: 0 0 auto; background: var(--input-bg); border: 1px solid var(--border);
+    color: var(--text-dim); width: 2rem; height: 2rem; border-radius: 99px; cursor: pointer; font-size: .95rem;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .theme-toggle:hover { color: var(--text); border-color: var(--accent); }
 
   .meta-line {
-    display: flex; flex-wrap: wrap; gap: .1rem .9rem; align-items: center;
+    display: flex; flex-wrap: wrap; gap: .1rem 1.1rem; align-items: center;
     color: var(--text-dim); font-size: .8rem; margin: 1rem 0 1.1rem; padding-bottom: 1rem;
     border-bottom: 1px solid var(--border-soft);
   }
+  .meta-line span { display: inline-flex; align-items: center; gap: .35rem; }
   .meta-line strong { color: var(--text); font-weight: 600; }
   .meta-line .good { color: var(--good); }
 
@@ -745,13 +769,13 @@ regen_index_html() {
   .tag-row-sub { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .3rem; }
   .tag-row-right { flex: 0 0 auto; text-align: right; }
   .tag-row-size { color: var(--text-dim); font-size: .78rem; }
-  .tag-row-digest { margin-top: .3rem; }
+  .tag-row-published { color: var(--text-faint); font-size: .74rem; margin-top: .15rem; }
 
   .tag-details {
     display: none; padding: .15rem .9rem .8rem 2.35rem; border-top: 1px dashed var(--border-soft);
   }
   .tag-item.expanded .tag-details { display: block; }
-  .detail-line { display: flex; gap: .6rem; align-items: baseline; padding: .2rem 0; font-size: .74rem; flex-wrap: wrap; }
+  .detail-line { display: flex; gap: .5rem; align-items: baseline; padding: .2rem 0; font-size: .74rem; flex-wrap: wrap; }
   .detail-label { color: var(--text-faint); flex: 0 0 auto; min-width: 9.5rem; }
   .detail-value { font-family: var(--mono); color: var(--text-dim); word-break: break-all; flex: 1 1 200px; min-width: 0; }
   .detail-value.plain { font-family: inherit; }
@@ -760,17 +784,17 @@ regen_index_html() {
          padding:.1rem .25rem .1rem .45rem; border-radius:6px; font-size:.74rem; margin: .08rem .2rem .08rem 0; white-space: nowrap; }
   .tag-copy { opacity: .55; cursor: pointer; padding: .05rem .25rem; border-radius: 4px; line-height:1; }
   .tag-copy:hover { opacity: 1; background: rgba(110,158,255,.2); }
-  .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; cursor: pointer; white-space: nowrap; }
-  .digest::after { content: "⧉"; display: inline-block; opacity: 0; margin-left: .35rem; font-size: .82rem; transition: opacity .1s; }
-  .digest:hover { color: var(--text); }
-  .digest:hover::after { opacity: .8; }
-  .digest.copied { color: var(--good); }
+  /* Digest : texte simple non cliquable dans le panneau de détail -- la
+     copie se fait via un bouton explicite juste à côté (.copy-btn), plutôt
+     que par un clic sur le texte lui-même. */
+  .digest { font-family: var(--mono); color: var(--text-dim); font-size:.72rem; word-break: break-all; }
+  .copy-btn {
+    flex: 0 0 auto; background: var(--panel-alt); border: 1px solid var(--border); color: var(--text-dim);
+    cursor: pointer; border-radius: 4px; padding: .05rem .35rem; font-size: .78rem; line-height: 1.5;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+  .copy-btn.copied { color: var(--good); border-color: var(--good); }
   .digest-none { font-family: var(--mono); color: var(--text-faint); font-size:.72rem; }
-  /* Dans le panneau de détail, le digest complet doit pouvoir se rompre sur
-     plusieurs lignes (contrairement au digest tronqué de l'en-tête de ligne,
-     volontairement sur une seule ligne) -- .digest fixe white-space:nowrap,
-     à annuler ici après coup pour que word-break:break-all agisse. */
-  .detail-value.digest { white-space: normal; }
   .badge { display:inline-block; background: var(--panel-alt); border:1px solid var(--border);
            padding:.05rem .45rem; border-radius:99px; font-size:.68rem; margin:.08rem .2rem .08rem 0; color: var(--text-dim); }
   .badge-cosign { background: var(--good-dim); border-color: rgba(61,219,143,.35); color: var(--good); }
@@ -794,10 +818,8 @@ regen_index_html() {
 <div class="page">
 <header>
   <span class="brand-mark">📦</span>
-  <div>
-    <h1>Registry</h1>
-    <div class="subtitle">Générée hors-ligne le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</div>
-  </div>
+  <h1>Registry</h1>
+  <button type="button" class="theme-toggle" id="theme-toggle" title="Changer de thème">🌓</button>
 </header>
 
 <div class="meta-line" id="stats-bar"></div>
@@ -817,7 +839,7 @@ regen_index_html() {
 
 <div class="images" id="images"></div>
 <div class="empty" id="empty-state" style="display:none;">Aucune image ne correspond à ce filtre.</div>
-<footer>registry-cli.sh</footer>
+<footer>Généré le @@GENERATED_AT@@ par registry-cli.sh — aucune ressource externe chargée par cette page.</footer>
 </div>
 <script>
 const REGISTRY_DATA =
@@ -829,6 +851,23 @@ HTML_PART1_EOF
 
 const collapsed = new Set();
 const expandedRows = new Set();
+
+// Thème clair/sombre : respecte les préférences système par défaut, mais un
+// choix explicite via le bouton de bascule est mémorisé (localStorage) et
+// prime dessus, y compris entre deux visites.
+try {
+    const savedTheme = localStorage.getItem("registry-theme");
+    if (savedTheme === "light" || savedTheme === "dark") {
+        document.documentElement.dataset.theme = savedTheme;
+    }
+} catch (e) {}
+
+document.getElementById("theme-toggle").addEventListener("click", () => {
+    const isDark = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === "#18181b";
+    const next = isDark ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("registry-theme", next); } catch (e) {}
+});
 
 // Préfixe l'hôte:port depuis lequel cette page est effectivement consultée
 // (ex: "localhost:8000/"), pour que les références copiées soient directement
@@ -853,8 +892,25 @@ function humanDate(iso) {
     }
 }
 
-function shortDigest(d) {
-    return d.length > 19 ? d.slice(0, 19) + "…" : d;
+// Delta relatif style "Published X ago" du container registry GitLab --
+// affiché sur la ligne repliée, la date absolue restant disponible en
+// info-bulle (title=humanDate(iso)) pour qui veut la précision exacte.
+function relativeDate(iso) {
+    if (!iso) return "date inconnue";
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return iso;
+    const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (diffSec < 60) return "à l'instant";
+    const mins = Math.floor(diffSec / 60);
+    if (mins < 60) return `il y a ${mins} min`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `il y a ${hours} h`;
+    const days = Math.floor(hours / 24);
+    if (days < 30) return `il y a ${days} j`;
+    const months = Math.floor(days / 30);
+    if (months < 12) return `il y a ${months} mois`;
+    const years = Math.floor(days / 365);
+    return `il y a ${years} an${years > 1 ? "s" : ""}`;
 }
 
 function escapeHtml(s) {
@@ -934,10 +990,10 @@ function renderStats() {
     const totalSize = REGISTRY_DATA.reduce((sum, r) => sum + r.size, 0);
 
     document.getElementById("stats-bar").innerHTML = `
-        <span><strong>${nImages}</strong> image${nImages === 1 ? "" : "s"}</span>
-        <span><strong>${nTags}</strong> tag${nTags === 1 ? "" : "s"}</span>
-        <span>${humanSize(totalSize)}</span>
-        <span class="${nSigned ? "good" : ""}">${nSigned ? "🔏 " : ""}${nSigned} avec cosign</span>
+        <span>📦 <strong>${nImages}</strong> image${nImages === 1 ? "" : "s"}</span>
+        <span>🏷️ <strong>${nTags}</strong> tag${nTags === 1 ? "" : "s"}</span>
+        <span>💾 ${humanSize(totalSize)}</span>
+        <span class="${nSigned ? "good" : ""}">🔏 ${nSigned} avec cosign</span>
     `;
 }
 
@@ -975,10 +1031,26 @@ function renderGroup(g) {
         // Panneau de détail, dans l'esprit du container registry GitLab :
         // replié par défaut, il révèle le digest complet du manifeste, son
         // media type, et le digest de la config -- plutôt que d'imposer ces
-        // trois colonnes en permanence dans la ligne.
+        // trois colonnes en permanence dans la ligne. La copie se fait via un
+        // bouton explicite (.copy-btn), le digest lui-même n'est plus
+        // cliquable et n'apparaît nulle part sur la ligne repliée.
+        const copyBtn = (text, label) =>
+            `<button type="button" class="copy-btn" data-copy="${escapeHtml(text)}" title="Copier ${label}">⧉</button>`;
+
         const configLine = dg.configDigest
-            ? `<div class="detail-line"><span class="detail-label">Digest config</span><span class="digest detail-value" title="${dg.configDigest} (cliquer pour copier)" data-digest="${dg.configDigest}">${dg.configDigest}</span></div>`
+            ? `<div class="detail-line"><span class="detail-label">Digest config</span><span class="digest detail-value">${dg.configDigest}</span>${copyBtn(dg.configDigest, "le digest de la config")}</div>`
             : `<div class="detail-line"><span class="detail-label">Digest config</span><span class="detail-value plain">— (manifest-list/index, pas de config à ce niveau)</span></div>`;
+
+        // Compagnons cosign (convention sha256-<digest>.{sig,att,sbom}) --
+        // rappelés en toutes lettres dans le détail, en plus des badges déjà
+        // visibles sur la ligne repliée.
+        const digestHex = dg.digest.includes(":") ? dg.digest.split(":")[1] : dg.digest;
+        const cosignBase = `sha256-${digestHex}`;
+        const cosignLines = [
+            dg.signed ? `<div class="detail-line"><span class="detail-label">Signature</span><span class="detail-value plain">🔏 cosign — <span class="digest detail-value">${cosignBase}.sig</span></span></div>` : "",
+            dg.attested ? `<div class="detail-line"><span class="detail-label">Attestation</span><span class="detail-value plain">📎 cosign — <span class="digest detail-value">${cosignBase}.att</span></span></div>` : "",
+            dg.sbom ? `<div class="detail-line"><span class="detail-label">SBOM</span><span class="detail-value plain">📄 cosign — <span class="digest detail-value">${cosignBase}.sbom</span></span></div>` : "",
+        ].join("");
 
         return `
             <div class="tag-item${isExpanded ? " expanded" : ""}" data-row-toggle="${escapeHtml(rowKey)}">
@@ -991,15 +1063,16 @@ function renderGroup(g) {
                         </div>
                     </div>
                     <div class="tag-row-right">
-                        <div class="tag-row-size">${humanSize(dg.size)} · ${humanDate(dg.mtime)}</div>
-                        <div class="tag-row-digest digest" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${shortDigest(dg.digest)}</div>
+                        <div class="tag-row-size">${humanSize(dg.size)}</div>
+                        <div class="tag-row-published" title="${humanDate(dg.mtime)}">Publié ${relativeDate(dg.mtime)}</div>
                     </div>
                 </div>
                 <div class="tag-details">
-                    <div class="detail-line"><span class="detail-label">Digest manifeste</span><span class="digest detail-value" title="${dg.digest} (cliquer pour copier)" data-digest="${dg.digest}">${dg.digest}</span></div>
+                    <div class="detail-line"><span class="detail-label">Digest manifeste</span><span class="digest detail-value">${dg.digest}</span>${copyBtn(dg.digest, "le digest du manifeste")}</div>
                     <div class="detail-line"><span class="detail-label">Media type</span><span class="detail-value plain">${escapeHtml(dg.mediaType || "?")}</span></div>
                     ${configLine}
                     <div class="detail-line"><span class="detail-label">Blobs</span><span class="detail-value plain">${dg.blobs}</span></div>
+                    ${cosignLines}
                 </div>
             </div>`;
     }).join("");
@@ -1063,9 +1136,9 @@ document.getElementById("images").addEventListener("click", (e) => {
         else { collapsed.add(key); card.classList.add("collapsed"); }
         return;
     }
-    const digestCell = e.target.closest(".digest");
-    if (digestCell) {
-        copyToClipboard(digestCell.dataset.digest, digestCell, "copié !");
+    const copyBtn = e.target.closest(".copy-btn");
+    if (copyBtn) {
+        copyToClipboard(copyBtn.dataset.copy, copyBtn, "✓");
         return;
     }
     const tagCopy = e.target.closest(".tag-copy");
