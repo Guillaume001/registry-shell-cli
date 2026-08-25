@@ -6,6 +6,8 @@
 #
 #   pull    : télécharge une image (skopeo) et la convertit en archive .tar.gz
 #             de l'arborescence v2/, signable avec GPG
+#   mirror  : synchronise plusieurs images/tags (skopeo sync + config YAML)
+#             directement dans une registry existante, en place
 #   upload  : vérifie (checksum + signature GPG si présente) et place le
 #             contenu d'une archive dans une registry locale (fichiers)
 #   list    : inventaire des images/tags présents dans une registry
@@ -39,6 +41,8 @@ Usage: ${SCRIPT_NAME} <commande> [options]
 
 Commandes :
   pull        Télécharge une image et produit une archive (éventuellement signée)
+  mirror      Synchronise plusieurs images/tags (skopeo sync + config YAML) dans
+                une registry existante, en place -- rejouable périodiquement
   upload      Place une archive dans une registry (fichiers locaux)
   list        Liste les images et tags disponibles dans une registry
   remove      Supprime un tag ou une image entière d'une registry
@@ -1507,6 +1511,172 @@ EOF
 }
 
 # ===========================================================================
+# Commande : mirror
+# ===========================================================================
+usage_mirror() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} mirror -c CONFIG.yaml -r REGISTRY_ROOT [options]
+
+Options obligatoires :
+  -c, --config FICHIER        Fichier YAML pour 'skopeo sync --src yaml' (liste,
+                                 par registre, les images et tags à synchroniser --
+                                 voir 'man skopeo-sync' ou le README pour le format)
+  -r, --registry-root DIR     Racine filesystem de la registry à mettre à jour EN
+                                 PLACE (comme 'upload -r' : fusion additive, rien
+                                 n'est supprimé, dédupliquée par digest)
+
+Options :
+      --with-signatures        Récupère aussi, pour chaque tag synchronisé, les
+                                 artefacts cosign associés (signature/attestation/
+                                 SBOM/referrers) -- voir '${SCRIPT_NAME} pull --help'.
+                                 Désactivé par défaut.
+      --keep-going              Ne s'arrête pas si un des tags listés dans le
+                                 fichier de config est introuvable/en échec
+                                 (transmis à 'skopeo sync --keep-going')
+      --dry-run                 N'écrit rien dans REGISTRY_ROOT : affiche ce que
+                                 skopeo synchroniserait puis s'arrête (transmis à
+                                 'skopeo sync --dry-run')
+      --regen-config            Régénère v2/.htaccess + index.html après la fusion
+                                 (défaut : activé -- utilisez --no-regen-config pour
+                                 désactiver)
+      --no-regen-config         Désactive cette régénération
+      --keep-workdir             Ne pas supprimer le répertoire de travail temporaire
+
+Pensé pour être rejoué périodiquement (cron) afin de garder à jour un ou
+plusieurs tags mouvants (ex: "latest") sans retélécharger ce qui n'a pas
+changé : la fusion dans REGISTRY_ROOT est additive et dédupliquée par digest,
+comme pour 'upload'.
+
+Exemple de fichier de config :
+  docker.io:
+    images:
+      library/alpine:
+        - "3.20"
+        - "latest"
+  quay.io:
+    images:
+      coreos/etcd:
+        - latest
+
+Exemple :
+  ${SCRIPT_NAME} mirror -c sync.yaml -r /srv/registrish --with-signatures
+EOF
+}
+
+cmd_mirror() {
+    local config="" root="" with_signatures="false" keep_going="false"
+    local dry_run="false" regen_config="true" keep_workdir="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--config) config="$2"; shift 2 ;;
+            -r|--registry-root) root="$2"; shift 2 ;;
+            --with-signatures) with_signatures="true"; shift ;;
+            --keep-going) keep_going="true"; shift ;;
+            --dry-run) dry_run="true"; shift ;;
+            --regen-config) regen_config="true"; shift ;;
+            --no-regen-config) regen_config="false"; shift ;;
+            --keep-workdir) keep_workdir="true"; shift ;;
+            -h|--help) usage_mirror; exit 0 ;;
+            *) echo "Option inconnue pour 'mirror' : $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$config" ]] || { echo "Erreur : -c/--config est obligatoire." >&2; usage_mirror; exit 1; }
+    [[ -f "$config" ]] || { echo "Erreur : fichier de config introuvable : $config" >&2; exit 1; }
+    [[ -n "$root" ]] || { echo "Erreur : -r/--registry-root est obligatoire." >&2; usage_mirror; exit 1; }
+
+    command -v skopeo >/dev/null 2>&1 || { echo "Erreur : 'skopeo' est requis pour 'mirror'." >&2; exit 1; }
+
+    local workdir
+    workdir="$(mktemp -d "/tmp/registry-cli-mirror.XXXXXX")"
+    if [[ "$keep_workdir" == "true" ]]; then
+        trap 'echo "Répertoire de travail conservé : '"$workdir"'"' EXIT
+    else
+        trap 'rm -rf "'"$workdir"'"' EXIT
+    fi
+
+    local staging_dir="${workdir}/staging"
+    mkdir -p "$staging_dir"
+
+    echo "==> Synchronisation depuis ${config} (skopeo sync)..."
+    local -a sync_args=(sync --src yaml --dest dir --scoped)
+    [[ "$keep_going" == "true" ]] && sync_args+=(--keep-going)
+    [[ "$dry_run" == "true" ]] && sync_args+=(--dry-run)
+    sync_args+=("$config" "$staging_dir")
+    skopeo "${sync_args[@]}"
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo "==> --dry-run : aucune modification apportée à ${root}."
+        exit 0
+    fi
+
+    echo "==> Fusion des tags synchronisés dans ${root}/v2..."
+    local v2_root="${root}/v2"
+    mkdir -p "$v2_root"
+
+    local -A processed_digests=()
+    local manifest_json leaf_dir rel image_full tag normalized_image digest_hex
+    local n_tags=0 n_failed=0
+
+    while IFS= read -r manifest_json; do
+        leaf_dir="$(dirname "$manifest_json")"
+        rel="${leaf_dir#"$staging_dir"/}"
+        image_full="${rel%:*}"
+        tag="${rel##*:}"
+
+        if [[ -z "$image_full" || "$image_full" == "$rel" ]]; then
+            echo "    Ignoré (chemin de sortie skopeo sync inattendu) : ${rel}" >&2
+            n_failed=$((n_failed + 1))
+            continue
+        fi
+
+        normalized_image="$(normalize_image_name "$image_full")"
+        echo "    - ${normalized_image}:${tag}"
+        if ! convert_skopeo_dir_to_v2 "$leaf_dir" "$normalized_image" "$tag" "$v2_root"; then
+            n_failed=$((n_failed + 1))
+            continue
+        fi
+        n_tags=$((n_tags + 1))
+
+        if [[ "$with_signatures" == "true" ]]; then
+            digest_hex="$(sha256sum "$manifest_json" | cut -d' ' -f1)"
+            local dedup_key="${normalized_image}@${digest_hex}"
+            if [[ -z "${processed_digests[$dedup_key]:-}" ]]; then
+                processed_digests["$dedup_key"]=1
+                local sanitized_key="${dedup_key//[:@\/]/_}"
+                local companion companion_dir suffix source_ref="docker://${normalized_image}"
+                for suffix in sig att sbom; do
+                    companion="sha256-${digest_hex}.${suffix}"
+                    companion_dir="${workdir}/cosign-${sanitized_key}-${suffix}"
+                    if try_pull_cosign_tag "$source_ref" "$normalized_image" "$companion" "$v2_root" "$companion_dir"; then
+                        echo "      trouvé : ${companion}"
+                    fi
+                done
+                local ref_workdir="${workdir}/refs-${sanitized_key}"
+                mkdir -p "$ref_workdir"
+                if pull_oci_referrers_fallback "$source_ref" "$normalized_image" "$digest_hex" "$v2_root" "$ref_workdir"; then
+                    echo "      trouvé : index de referrers"
+                fi
+            fi
+        fi
+    done < <(find "$staging_dir" -type f -name manifest.json | sort)
+
+    if [[ "$regen_config" == "true" ]]; then
+        echo "==> Régénération de v2/.htaccess..."
+        regen_apache2_config "$root"
+        echo "==> Régénération de la page index.html..."
+        regen_index_html "$root"
+    fi
+
+    echo
+    echo "==> Terminé : ${n_tags} tag(s) mirroré(s)."
+    if [[ $n_failed -gt 0 ]]; then
+        echo "    ${n_failed} tag(s) en échec (voir messages ci-dessus)."
+    fi
+}
+
+# ===========================================================================
 # Commande : upload
 # ===========================================================================
 usage_upload() {
@@ -2310,7 +2480,7 @@ cmd_completion() {
 #   registry-cli.sh completion > ~/.local/share/bash-completion/completions/registry-cli
 #
 
-_registry_cli_commands="pull upload list remove index verify sbom completion"
+_registry_cli_commands="pull mirror upload list remove index verify sbom completion"
 
 _registry_cli_find_opt_value() {
     local opt_list="$1" opt i
@@ -2356,7 +2526,7 @@ _registry_cli_complete() {
     fi
 
     case "$prev" in
-        -o|--output|-a|--archive|-k|--gpg-key|--gpg-keyring)
+        -o|--output|-a|--archive|-k|--gpg-key|--gpg-keyring|-c|--config)
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
@@ -2402,6 +2572,9 @@ _registry_cli_complete() {
     case "$cmd" in
         pull)
             opts="-i --image -t --tag -d --digest -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
+            ;;
+        mirror)
+            opts="-c --config -r --registry-root --with-signatures --keep-going --dry-run --regen-config --no-regen-config --keep-workdir -h --help"
             ;;
         upload)
             opts="-a --archive -r --registry-root --regen-config --no-regen-config --require-signature --skip-checksum --gpg-keyring -h --help"
@@ -2459,6 +2632,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 
     case "$COMMAND" in
         pull) cmd_pull "$@" ;;
+        mirror) cmd_mirror "$@" ;;
         upload) cmd_upload "$@" ;;
         list) cmd_list "$@" ;;
         remove) cmd_remove "$@" ;;

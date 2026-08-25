@@ -18,6 +18,7 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
 - [Concepts](#concepts)
 - [Commandes](#commandes)
   - [pull](#pull--télécharger-une-image-et-produire-une-archive)
+  - [mirror](#mirror--synchroniser-plusieurs-imagestags-en-place-skopeo-sync)
   - [upload](#upload--placer-une-archive-dans-la-registry)
   - [list](#list--inventaire-de-la-registry)
   - [remove](#remove--supprimer-un-tag-un-digest-ou-une-image)
@@ -187,6 +188,63 @@ registry-cli.sh pull -i alpine -t 3.20 --from-dir /tmp/skopeo-alpine
 
 registry-cli.sh pull -i alpine -t 3.20 --with-signatures
 #   embarque en plus la signature/attestation/SBOM cosign si présentes
+```
+
+### `mirror` — synchroniser plusieurs images/tags en place (`skopeo sync`)
+
+```
+registry-cli.sh mirror -c CONFIG.yaml -r REGISTRY_ROOT [options]
+```
+
+Contrairement à `pull` (une archive par tag, à uploader ensuite), `mirror`
+s'appuie sur [`skopeo sync`](https://github.com/containers/skopeo/blob/main/docs/skopeo-sync.1.md)
+pour récupérer, en une seule commande, une sélection de tags issue de
+plusieurs images/registres, et les fusionne directement (en place, de façon
+additive et dédupliquée par digest — comme `upload`) dans une registry déjà
+servie. Pensé pour être **rejoué périodiquement (cron)** afin de garder à
+jour des tags mouvants comme `latest`, sans retélécharger ce qui n'a pas
+changé.
+
+| Option | Description |
+|---|---|
+| `-c`, `--config FICHIER` | **Obligatoire.** Fichier YAML au format `skopeo sync --src yaml` (voir exemple ci-dessous, ou `man skopeo-sync`). Transmis tel quel à skopeo, non interprété par le script. |
+| `-r`, `--registry-root DIR` | **Obligatoire.** Racine de la registry à mettre à jour EN PLACE. |
+| `--with-signatures` | Recherche aussi, pour chaque tag synchronisé, les artefacts cosign associés (signature/attestation/SBOM/referrers) — une seule fois par digest (plusieurs tags pointant sur le même contenu ne redéclenchent pas la recherche). Désactivé par défaut, comme pour `pull`. |
+| `--keep-going` | Transmis à `skopeo sync --keep-going` : ne s'arrête pas si un tag listé est introuvable/en échec. |
+| `--dry-run` | Transmis à `skopeo sync --dry-run` : n'écrit rien dans `REGISTRY_ROOT`, affiche seulement ce qui serait synchronisé. |
+| `--regen-config` / `--no-regen-config` | Régénère `v2/.htaccess` + `index.html` après la fusion (défaut : activé). |
+| `--keep-workdir` | Conserve le répertoire de travail temporaire (debug). |
+
+**Format du fichier de config** (voir `man skopeo-sync` pour la référence
+complète — regex de tags, contraintes semver, identifiants par registre...) :
+
+```yaml
+docker.io:
+  images:
+    library/alpine:
+      - "3.20"
+      - "latest"
+quay.io:
+  images:
+    coreos/etcd:
+      - latest
+```
+
+**Exemples :**
+
+```bash
+registry-cli.sh mirror -c sync.yaml -r /srv/registrish
+
+registry-cli.sh mirror -c sync.yaml -r /srv/registrish --with-signatures
+
+# Aperçu sans rien écrire :
+registry-cli.sh mirror -c sync.yaml -r /srv/registrish --dry-run
+```
+
+**Exemple de crontab** pour garder `latest` à jour toutes les heures :
+
+```cron
+0 * * * *  /opt/registry-cli.sh mirror -c /etc/registrish/sync.yaml -r /srv/registrish >> /var/log/registrish-mirror.log 2>&1
 ```
 
 ### `upload` — placer une archive dans la registry

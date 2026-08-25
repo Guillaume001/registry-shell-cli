@@ -54,43 +54,101 @@ build_skopeo_dir() {
 # répertoire "skopeo dir:" à copier tel quel dans DEST_DIR, soit le mot-clé
 # FAIL pour simuler une référence introuvable (skopeo copy non-zéro).
 # Permet de tester 'pull --with-signatures' sans réseau ni vrai skopeo.
+#
+# Simule aussi `skopeo sync --src yaml --dest dir --scoped [--keep-going]
+# [--dry-run] CONFIG DEST_DIR` en consultant le MÊME fichier TSV
+# (FAKE_SKOPEO_MAP), mais avec CONFIG (le chemin du fichier YAML, pas une
+# référence d'image) comme sujet du filtrage par sous-chaîne : "action" est
+# alors un répertoire déjà structuré comme une sortie réelle de
+# `skopeo sync --dest dir --scoped` (DEST_DIR/<registre>/<image>:<tag>/...),
+# copié tel quel dans DEST_DIR. Permet de tester 'mirror' sans réseau ni
+# vrai skopeo. Avec --dry-run, rien n'est copié (comme le vrai skopeo sync).
 install_fake_skopeo() {
     local bin_dir="$1"
     mkdir -p "$bin_dir"
     cat > "${bin_dir}/skopeo" <<'FAKE_SKOPEO_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "${1:-}" == "copy" ]] || { echo "fake skopeo: commande non supportée : $*" >&2; exit 2; }
-shift
-src_ref="" dest_dir=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --override-arch|--override-os) shift 2 ;;
-        --all) shift ;;
-        dir:*) dest_dir="${1#dir:}"; shift ;;
-        *)
-            if [[ -z "$src_ref" ]]; then src_ref="$1"; else dest_dir="${1#dir:}"; fi
-            shift
-            ;;
-    esac
-done
-[[ -n "${FAKE_SKOPEO_MAP:-}" && -f "$FAKE_SKOPEO_MAP" ]] || { echo "fake skopeo: FAKE_SKOPEO_MAP non défini" >&2; exit 2; }
-while IFS=$'\t' read -r pattern action; do
-    [[ -z "$pattern" ]] && continue
-    if [[ "$src_ref" == *"$pattern"* ]]; then
+
+fake_skopeo_lookup() {
+    local subject="$1"
+    [[ -n "${FAKE_SKOPEO_MAP:-}" && -f "$FAKE_SKOPEO_MAP" ]] || { echo "fake skopeo: FAKE_SKOPEO_MAP non défini" >&2; exit 2; }
+    while IFS=$'\t' read -r pattern action; do
+        [[ -z "$pattern" ]] && continue
+        if [[ "$subject" == *"$pattern"* ]]; then
+            printf '%s' "$action"
+            return 0
+        fi
+    done < "$FAKE_SKOPEO_MAP"
+    return 1
+}
+
+case "${1:-}" in
+    copy)
+        shift
+        src_ref="" dest_dir=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --override-arch|--override-os) shift 2 ;;
+                --all) shift ;;
+                dir:*) dest_dir="${1#dir:}"; shift ;;
+                *)
+                    if [[ -z "$src_ref" ]]; then src_ref="$1"; else dest_dir="${1#dir:}"; fi
+                    shift
+                    ;;
+            esac
+        done
+        action="$(fake_skopeo_lookup "$src_ref")" || { echo "fake skopeo: aucune correspondance pour $src_ref" >&2; exit 1; }
         if [[ "$action" == "FAIL" ]]; then
             echo "fake skopeo: échec simulé pour $src_ref" >&2
             exit 1
         fi
         mkdir -p "$dest_dir"
         cp -a "${action}/." "$dest_dir/"
-        exit 0
-    fi
-done < "$FAKE_SKOPEO_MAP"
-echo "fake skopeo: aucune correspondance pour $src_ref" >&2
-exit 1
+        ;;
+    sync)
+        shift
+        dry_run="false" config="" dest_dir=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --src|--dest) shift 2 ;;
+                --scoped|--keep-going|-a|--all) shift ;;
+                --dry-run) dry_run="true"; shift ;;
+                *)
+                    if [[ -z "$config" ]]; then config="$1"; else dest_dir="$1"; fi
+                    shift
+                    ;;
+            esac
+        done
+        action="$(fake_skopeo_lookup "$config")" || { echo "fake skopeo: aucune correspondance pour $config" >&2; exit 1; }
+        if [[ "$action" == "FAIL" ]]; then
+            echo "fake skopeo: échec simulé pour $config" >&2
+            exit 1
+        fi
+        if [[ "$dry_run" == "false" ]]; then
+            mkdir -p "$dest_dir"
+            cp -a "${action}/." "$dest_dir/"
+        fi
+        ;;
+    *)
+        echo "fake skopeo: commande non supportée : $*" >&2
+        exit 2
+        ;;
+esac
 FAKE_SKOPEO_EOF
     chmod +x "${bin_dir}/skopeo"
+}
+
+# Construit, sous DEST_DIR, une arborescence imitant la sortie de
+# `skopeo sync --dest dir --scoped` pour UN tag : DEST_DIR/<registre>/<image
+# éventuellement imbriquée>:<tag>/{manifest.json,...} (répertoire "skopeo
+# dir:" minimal, produit par build_skopeo_dir). Utilisé pour construire le
+# répertoire fixture référencé par FAKE_SKOPEO_MAP pour 'mirror'.
+#   build_sync_dir_entry DEST_DIR REGISTRY_AND_IMAGE TAG
+# Affiche sur stdout : "<config_digest> <layer_digest> <manifest_digest>"
+build_sync_dir_entry() {
+    local dest_dir="$1" registry_and_image="$2" tag="$3"
+    build_skopeo_dir "${dest_dir}/${registry_and_image}:${tag}"
 }
 
 # Écrit un exécutable "cosign" factice dans BIN_DIR. Gère juste assez de
