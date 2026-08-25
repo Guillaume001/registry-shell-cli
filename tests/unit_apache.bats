@@ -18,25 +18,13 @@ setup() {
     grep -q "MANIFEST_UNKNOWN" "${ROOT}/v2/error.json"
 }
 
-@test "regen_apache2_config: affiche un rappel sur AllowOverride (indispensable pour que .htaccess soit pris en compte)" {
+@test "regen_apache2_config: affiche un rappel bref sur AllowOverride, renvoyant au README pour le détail" {
+    # Le détail (mod_mime_magic/MIMEMagicFile, "unsupported schema version 2"...)
+    # vit dans le README, pas dans cette sortie -- gardée volontairement courte.
     run regen_apache2_config "$ROOT"
     [ "$status" -eq 0 ]
     echo "$output" | grep -qi "AllowOverride"
-    echo "$output" | grep -q "unsupported schema version 2"
-}
-
-@test "regen_apache2_config: affiche un rappel sur mod_mime_magic/MIMEMagicFile (aucun .htaccess ne peut le neutraliser)" {
-    # Régression : vérifié en conditions réelles (Apache + mod_mime_magic
-    # actif) qu'aucune combinaison de directives de .htaccess -- ForceType,
-    # Header unset/always unset, RemoveEncoding -- ne retire le
-    # Content-Encoding que mod_mime_magic attribue lui-même à un blob sans
-    # extension. Seul "MIMEMagicFile none" côté VirtualHost/serveur le fait.
-    # Ce rappel doit rester visible pour ne pas laisser croire que
-    # regen_apache2_config règle tout depuis les fichiers qu'il écrit.
-    run regen_apache2_config "$ROOT"
-    [ "$status" -eq 0 ]
-    echo "$output" | grep -qi "mod_mime_magic"
-    echo "$output" | grep -q "MIMEMagicFile"
+    echo "$output" | grep -q "README"
 }
 
 @test "regen_apache2_config: ForceType par mediaType sur les fichiers de manifests/" {

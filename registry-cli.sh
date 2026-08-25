@@ -631,17 +631,8 @@ regen_apache2_config() {
         printf '%s\n' "$BLOBS_HTACCESS_CONTENT" > "${blobs_dir}/.htaccess"
     done < <(find "${root}/v2" -type d -name blobs | sort)
 
-    echo "    v2/.htaccess, v2/error.json, un .htaccess par image (manifests/) et"
-    echo "    un .htaccess anti-compression par image (blobs/) ont été écrits."
-    echo "    Rappel : ces .htaccess ne sont pris en compte que si Apache a"
-    echo "    'AllowOverride All' (ou 'FileInfo') sur ce répertoire — ce n'est"
-    echo "    PAS le réglage par défaut de l'image httpd:2.4 officielle. Sans"
-    echo "    ça, podman/docker pull échoue avec 'unsupported schema version 2'"
+    echo "    .htaccess écrits. Rappel : nécessitent 'AllowOverride All' côté Apache"
     echo "    (voir section 'Servir la registry avec Apache2' du README)."
-    echo "    Si mod_mime_magic est actif côté serveur (courant sur RHEL/CentOS),"
-    echo "    aucun .htaccess ne peut l'empêcher de mal étiqueter les blobs"
-    echo "    ('Content-Encoding' fantaisiste, ex: x-gzip) : désactivez-le via"
-    echo "    'MIMEMagicFile none' dans la config Apache (même section du README)."
 }
 
 # ===========================================================================
