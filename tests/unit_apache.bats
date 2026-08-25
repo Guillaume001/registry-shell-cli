@@ -25,6 +25,20 @@ setup() {
     echo "$output" | grep -q "unsupported schema version 2"
 }
 
+@test "regen_apache2_config: affiche un rappel sur mod_mime_magic/MIMEMagicFile (aucun .htaccess ne peut le neutraliser)" {
+    # Régression : vérifié en conditions réelles (Apache + mod_mime_magic
+    # actif) qu'aucune combinaison de directives de .htaccess -- ForceType,
+    # Header unset/always unset, RemoveEncoding -- ne retire le
+    # Content-Encoding que mod_mime_magic attribue lui-même à un blob sans
+    # extension. Seul "MIMEMagicFile none" côté VirtualHost/serveur le fait.
+    # Ce rappel doit rester visible pour ne pas laisser croire que
+    # regen_apache2_config règle tout depuis les fichiers qu'il écrit.
+    run regen_apache2_config "$ROOT"
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -qi "mod_mime_magic"
+    echo "$output" | grep -q "MIMEMagicFile"
+}
+
 @test "regen_apache2_config: ForceType par mediaType sur les fichiers de manifests/" {
     local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
     build_skopeo_dir "$skopeo_dir" > /dev/null
@@ -62,7 +76,27 @@ setup() {
     local htaccess="${ROOT}/v2/myimage/blobs/.htaccess"
     [ -f "$htaccess" ]
     grep -q "SetEnv no-gzip 1" "$htaccess"
-    grep -q "Header unset Content-Encoding" "$htaccess"
+    grep -q "Header always unset Content-Encoding" "$htaccess"
+}
+
+# --- Régression : mod_mime_magic (RHEL/CentOS) renifle nos blobs sans
+# extension et leur attribue "Content-Type: application/x-tar" +
+# "Content-Encoding: x-gzip" -- un alias non standard que ni Go
+# (podman/skopeo/docker) ni leur propre détection de compression ne
+# reconnaissent, menant à une lecture erronée du corps de la réponse et donc
+# à un digest différent de celui attendu ("Digest did not match"). Constaté
+# en conditions réelles avec un vrai Apache/RHEL servant une registry
+# produite par ce script.
+
+@test "regen_apache2_config: blobs/.htaccess force un Content-Type opaque (empêche le reniflage mod_mime_magic)" {
+    local skopeo_dir="${BATS_TEST_TMPDIR}/skopeo-src"
+    build_skopeo_dir "$skopeo_dir" > /dev/null
+    convert_skopeo_dir_to_v2 "$skopeo_dir" "myimage" "3.20" "${ROOT}/v2"
+
+    regen_apache2_config "$ROOT"
+
+    local htaccess="${ROOT}/v2/myimage/blobs/.htaccess"
+    grep -q "^ForceType application/octet-stream$" "$htaccess"
 }
 
 @test "regen_apache2_config: trouve les manifests/ d'images à namespace imbriqué (bug corrigé du glob non récursif)" {

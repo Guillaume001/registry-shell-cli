@@ -468,13 +468,34 @@ pull_oci_referrers_fallback() {
 #   altérer les octets transmis pour ces fichiers déjà compressés, ce qui
 #   casse la vérification de digest côté client (erreur "Digest did not
 #   match" chez podman/skopeo/docker). L'original ne s'en protège pas.
+#
+#   Constaté en conditions réelles (Apache/RHEL) : nos fichiers de blobs
+#   n'ont pas d'extension, donc mod_mime_magic (activé par défaut sur
+#   certaines distributions, notamment RHEL/CentOS) les *renifle* et leur
+#   attribue lui-même "Content-Type: application/x-tar" + un Content-Encoding
+#   du style "x-gzip" -- un alias non standard que ni la négociation de
+#   contenu de Go (podman/skopeo/docker) ni leur propre détection de
+#   compression ne reconnaissent, menant à une lecture erronée du corps de
+#   la réponse et donc à un digest différent de celui attendu.
+#   ForceType règle le Content-Type (vérifié : ligne ci-dessous). MAIS —
+#   vérifié tout aussi empiriquement, avec un vrai Apache et mod_mime_magic
+#   actif — ce Content-Encoding-là est fixé par mod_mime_magic via un champ
+#   interne (r->content_encoding) que "Header (always) unset" ne voit PAS et
+#   ne peut PAS retirer (contrairement au Content-Encoding ajouté par
+#   mod_deflate, celui-là bien neutralisable par ce même "Header unset" --
+#   d'où sa présence ci-dessous, elle reste utile pour ce cas-là). Aucune
+#   directive de .htaccess ne permet de désactiver mod_mime_magic : seul
+#   "MIMEMagicFile none" au niveau VirtualHost/serveur le fait (voir la
+#   section "Configuration Apache requise" du README) -- limite structurelle
+#   assumée de l'approche "que des fichiers statiques + .htaccess".
 # ===========================================================================
 ERROR_JSON_CONTENT='{"errors":[{"code":"MANIFEST_UNKNOWN","message":"that image or tag does not exist on this registry"}]}'
-BLOBS_HTACCESS_CONTENT='<IfModule mod_deflate.c>
+BLOBS_HTACCESS_CONTENT='ForceType application/octet-stream
+<IfModule mod_deflate.c>
   SetEnv no-gzip 1
 </IfModule>
 <IfModule mod_headers.c>
-  Header unset Content-Encoding
+  Header always unset Content-Encoding
 </IfModule>'
 
 regen_apache2_config() {
@@ -518,6 +539,10 @@ regen_apache2_config() {
     echo "    PAS le réglage par défaut de l'image httpd:2.4 officielle. Sans"
     echo "    ça, podman/docker pull échoue avec 'unsupported schema version 2'"
     echo "    (voir section 'Servir la registry avec Apache2' du README)."
+    echo "    Si mod_mime_magic est actif côté serveur (courant sur RHEL/CentOS),"
+    echo "    aucun .htaccess ne peut l'empêcher de mal étiqueter les blobs"
+    echo "    ('Content-Encoding' fantaisiste, ex: x-gzip) : désactivez-le via"
+    echo "    'MIMEMagicFile none' dans la config Apache (même section du README)."
 }
 
 # ===========================================================================
