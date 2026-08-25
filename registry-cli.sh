@@ -46,6 +46,7 @@ Commandes :
   upload      Place une archive dans une registry (fichiers locaux)
   list        Liste les images et tags disponibles dans une registry
   remove      Supprime un tag ou une image entière d'une registry
+  gc          Nettoie les manifests/blobs orphelins de TOUTE la registry
   index       (Re)génère la page index.html à la racine de la registry
   verify      Vérifie la signature cosign d'une image (clé publique)
   sbom        Extrait un SBOM CycloneDX attesté (cosign) au format JSON
@@ -2331,6 +2332,100 @@ cmd_remove() {
 }
 
 # ===========================================================================
+# Commande : gc
+#
+# Comme 'remove --gc', mais sur TOUTE la registry d'un coup, sans supprimer
+# aucun tag : parcourt chaque image sous v2/ et applique gc_image() (déjà
+# utilisée par 'remove', voir plus haut) pour nettoyer les manifests/blobs
+# devenus orphelins -- rien de ce qui est encore atteignable depuis un tag
+# (y compris les tags compagnons cosign sha256-<digest>.sig/.att/.sbom/nu)
+# n'est jamais touché. Pensé pour un usage périodique (cron) de routine, ou
+# après plusieurs 'remove --no-gc'.
+# ===========================================================================
+usage_gc() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} gc -r REGISTRY_ROOT [options]
+
+  -r, --registry-root DIR    Racine filesystem de la registry (obligatoire)
+      --purge-empty-images    Supprime aussi le répertoire des images qui ne
+                                contiennent plus aucun tag (situation inhabituelle :
+                                indique en général une manipulation manuelle de
+                                la registry). Désactivé par défaut.
+      --no-purge-empty-images Désactive (défaut).
+  -y, --yes                   Ne pas demander de confirmation
+      --dry-run                Simule le nettoyage sans rien supprimer
+      --regen-config           Régénère v2/.htaccess après nettoyage (défaut : activé)
+      --no-regen-config        Désactive la régénération de v2/.htaccess
+
+Exemples :
+  ${SCRIPT_NAME} gc -r /srv/registrish --dry-run
+  ${SCRIPT_NAME} gc -r /srv/registrish -y
+  ${SCRIPT_NAME} gc -r /srv/registrish -y --purge-empty-images
+EOF
+}
+
+cmd_gc() {
+    local root="" yes="false" dry_run="false" purge_empty_images="false" regen_config="true"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--registry-root) root="$2"; shift 2 ;;
+            -y|--yes) yes="true"; shift ;;
+            --dry-run) dry_run="true"; shift ;;
+            --purge-empty-images) purge_empty_images="true"; shift ;;
+            --no-purge-empty-images) purge_empty_images="false"; shift ;;
+            --regen-config) regen_config="true"; shift ;;
+            --no-regen-config) regen_config="false"; shift ;;
+            -h|--help) usage_gc; exit 0 ;;
+            *) echo "Option inconnue pour 'gc' : $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$root" ]] || { echo "Erreur : -r/--registry-root est obligatoire." >&2; exit 1; }
+    [[ -d "${root}/v2" ]] || { echo "Erreur : répertoire introuvable : ${root}/v2" >&2; exit 1; }
+
+    confirm_or_abort "$yes" "Nettoyer les manifests/blobs orphelins de toute la registry sous '${root}' ?"
+
+    local manifests_dir image_dir image_name n_images=0
+    while IFS= read -r manifests_dir; do
+        image_dir="$(dirname "$manifests_dir")"
+        image_name="${image_dir#"${root}"/v2/}"
+        n_images=$((n_images + 1))
+        echo "==> ${image_name}"
+        gc_image "$image_dir" "$dry_run" ""
+
+        if [[ "$purge_empty_images" == "true" ]]; then
+            local remaining
+            remaining=$(find "$manifests_dir" -maxdepth 1 -type f ! -name 'sha256:*' ! -name '.htaccess' 2>/dev/null | wc -l | tr -d ' ')
+            if [[ "$remaining" -eq 0 ]]; then
+                echo "    Aucun tag restant pour '${image_name}'."
+                if [[ "$dry_run" == "true" ]]; then
+                    echo "    [dry-run] supprimerait : $image_dir"
+                else
+                    rm -rf "$image_dir"
+                    echo "    Répertoire d'image '${image_name}' purgé."
+                fi
+            fi
+        fi
+    done < <(find "${root}/v2" -type d -name manifests | sort)
+
+    if [[ "$n_images" -eq 0 ]]; then
+        echo "Aucune image trouvée sous ${root}/v2."
+    fi
+
+    if [[ "$regen_config" == "true" && "$dry_run" == "false" ]]; then
+        echo "==> Régénération de v2/.htaccess..."
+        regen_apache2_config "$root"
+        echo "==> Régénération de la page index.html..."
+        regen_index_html "$root"
+    fi
+
+    echo
+    echo "==> Contenu actuel de la registry :"
+    cmd_list -r "$root"
+}
+
+# ===========================================================================
 # Commande : index
 # ===========================================================================
 usage_index() {
@@ -2626,7 +2721,7 @@ cmd_completion() {
 #   registry-cli.sh completion > ~/.local/share/bash-completion/completions/registry-cli
 #
 
-_registry_cli_commands="pull mirror upload list remove index verify sbom completion"
+_registry_cli_commands="pull mirror upload list remove gc index verify sbom completion"
 
 _registry_cli_find_opt_value() {
     local opt_list="$1" opt i
@@ -2731,6 +2826,9 @@ _registry_cli_complete() {
         remove)
             opts="-r --registry-root --image --tag --digest --gc --no-gc --purge-if-empty --no-purge-if-empty -y --yes --dry-run --regen-config --no-regen-config -h --help"
             ;;
+        gc)
+            opts="-r --registry-root --purge-empty-images --no-purge-empty-images -y --yes --dry-run --regen-config --no-regen-config -h --help"
+            ;;
         index)
             opts="-r --registry-root -h --help"
             ;;
@@ -2782,6 +2880,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         upload) cmd_upload "$@" ;;
         list) cmd_list "$@" ;;
         remove) cmd_remove "$@" ;;
+        gc) cmd_gc "$@" ;;
         index) cmd_index "$@" ;;
         verify) cmd_verify "$@" ;;
         sbom) cmd_sbom "$@" ;;

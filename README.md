@@ -22,6 +22,7 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
   - [upload](#upload--placer-une-archive-dans-la-registry)
   - [list](#list--inventaire-de-la-registry)
   - [remove](#remove--supprimer-un-tag-un-digest-ou-une-image)
+  - [gc](#gc--nettoyer-toute-la-registry-manifestsblobs-orphelins)
   - [index](#index--page-daccueil-html-de-la-registry)
   - [verify](#verify--vérifier-une-signature-cosign)
   - [sbom](#sbom--extraire-un-sbom-cyclonedx)
@@ -365,6 +366,44 @@ registry-cli.sh remove -r /srv/registrish --image alpine --tag 3.19 --dry-run
 # Désactiver le nettoyage automatique (juste retirer le pointeur de tag)
 registry-cli.sh remove -r /srv/registrish --image alpine --tag 3.19 \
     --no-gc --no-purge-if-empty
+```
+
+### `gc` — nettoyer toute la registry (manifests/blobs orphelins)
+
+```
+registry-cli.sh gc -r REGISTRY_ROOT [options]
+```
+
+Comme `remove --gc`, mais sur **toute** la registry en une seule commande, sans
+supprimer aucun tag : parcourt chaque image sous `v2/` et retire les
+manifestes/blobs devenus orphelins (plus référencés par aucun tag). Rien de
+ce qui reste atteignable depuis un tag — y compris les artefacts cosign
+compagnons (`.sig`/`.att`/`.sbom`/repli referrers) — n'est jamais touché.
+Pensé pour un usage périodique (cron) de routine, ou après plusieurs
+`remove --no-gc`.
+
+| Option | Description |
+|---|---|
+| `-r`, `--registry-root DIR` | **Obligatoire.** |
+| `--purge-empty-images` / `--no-purge-empty-images` | Supprime aussi le répertoire des images qui ne contiennent plus aucun tag (situation inhabituelle, indique en général une manipulation manuelle de la registry). **Désactivé par défaut.** |
+| `-y`, `--yes` | Ne demande pas de confirmation. |
+| `--dry-run` | Simule le nettoyage sans rien supprimer réellement. |
+| `--regen-config` / `--no-regen-config` | Régénère la config Apache après nettoyage. **Activé par défaut.** |
+
+**Exemples :**
+
+```bash
+# Prévisualiser ce qui serait nettoyé
+registry-cli.sh gc -r /srv/registrish --dry-run
+
+# Nettoyer pour de vrai
+registry-cli.sh gc -r /srv/registrish -y
+```
+
+**Exemple de crontab** pour un nettoyage hebdomadaire :
+
+```cron
+0 3 * * 0  /opt/registry-cli.sh gc -r /srv/registrish -y >> /var/log/registrish-gc.log 2>&1
 ```
 
 ### `index` — page d'accueil HTML de la registry
