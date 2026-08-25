@@ -144,7 +144,10 @@ programme nommé `registry-cli.sh`, `registry-cli`, ou `./registry-cli.sh`.
 ```
 registry-cli.sh pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz] [options]
 registry-cli.sh pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-dir DIR
+registry-cli.sh pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
 ```
+
+**Mode image unique** (`-i`) :
 
 | Option | Description |
 |---|---|
@@ -160,6 +163,16 @@ registry-cli.sh pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-di
 | `--keep-workdir` | Conserve le répertoire de travail temporaire (debug). |
 | `--with-signatures` | Recherche et embarque, en plus de l'image, les artefacts cosign associés : signature, attestation, SBOM legacy, et le repli statique OCI 1.1 "referrers". Voir [Signatures et SBOM (cosign)](#signatures-et-sbom-cosign). Nécessite `skopeo`. |
 | `--sig-from-dir DIR` / `--att-from-dir DIR` / `--sbom-from-dir DIR` | Équivalents 100% offline, artefact par artefact : `DIR` est un répertoire `skopeo dir:` déjà produit pour le tag compagnon correspondant. |
+
+**Mode multi-images/tags** (`-c`, incompatible avec `-i`/`-t`/`-d`/`--from-dir`) :
+
+| Option | Description |
+|---|---|
+| `-c`, `--config FICHIER` | **Obligatoire** (dans ce mode). Même fichier YAML `skopeo sync --src yaml` que [`mirror`](#mirror--synchroniser-plusieurs-imagestags-en-place-skopeo-sync). Synchronise tous les tags qu'il liste et les empaquette **tous dans une seule archive** — pratique pour préparer un transfert vers une machine air-gapped, à `upload`er là-bas ensuite. `-o`, `-k`, `--keep-workdir` et `--with-signatures` restent valables ; `--arch`/`--os`/`--source`/`--no-expand` sont ignorées (portées par le fichier de config). |
+| `--keep-going` | Transmis à `skopeo sync --keep-going` : ne s'arrête pas si un des tags listés est introuvable/en échec. |
+
+Nom d'archive **si `-o` est omis** en mode `-c` : `CONFIG-mirror.tar.gz` (basename du
+fichier de config, extension retirée).
 
 **Exemples :**
 
@@ -188,6 +201,14 @@ registry-cli.sh pull -i alpine -t 3.20 --from-dir /tmp/skopeo-alpine
 
 registry-cli.sh pull -i alpine -t 3.20 --with-signatures
 #   embarque en plus la signature/attestation/SBOM cosign si présentes
+
+# Poste connecté : synchronise plusieurs images/tags (sync.yaml, même format
+# que 'mirror') dans UNE SEULE archive
+registry-cli.sh pull -c sync.yaml -o mirror.tar.gz
+#   -> mirror.tar.gz contient tous les tags listés dans sync.yaml
+
+# Poste air-gapped : transférez mirror.tar.gz, puis
+registry-cli.sh upload -a mirror.tar.gz -r /srv/registrish
 ```
 
 ### `mirror` — synchroniser plusieurs images/tags en place (`skopeo sync`)

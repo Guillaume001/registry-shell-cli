@@ -453,6 +453,100 @@ pull_oci_referrers_fallback() {
 }
 
 # ===========================================================================
+# Synchronisation multi-images/tags via un fichier de config YAML (skopeo
+# sync --src yaml) : logique partagée par 'pull -c/--config' (empaquetée en
+# une seule archive .tar.gz, pour transfert vers une machine air-gapped puis
+# 'upload') et 'mirror' (fusionnée directement, en place, dans une registry
+# déjà servie).
+#
+# Args : config  v2_root  workdir  with_signatures(true/false)
+#        keep_going(true/false)  dry_run(true/false)
+#
+# Sortie standard (uniquement si dry_run=false) : une ligne
+# "IMAGE<TAB>TAG<TAB>DIGEST_HEX" par tag effectivement fusionné dans
+# v2_root -- les messages de progression vont sur stderr, pour ne pas
+# polluer cette sortie exploitée par l'appelant (compte des tags, métadonnées
+# d'archive...).
+#
+# Retour : 0 en cas de fusion (même partielle -- un échec de conversion sur
+# UN tag est compté et rapporté sur stderr mais n'interrompt pas le
+# traitement des tags suivants, contrairement à un échec de 'skopeo sync'
+# lui-même qui, via `set -e`, arrête tout de suite le script appelant) ;
+# 2 si dry_run=true (rien n'a été écrit dans v2_root, à l'appelant de
+# s'arrêter).
+# ===========================================================================
+sync_yaml_into_v2() {
+    local config="$1" v2_root="$2" workdir="$3"
+    local with_signatures="$4" keep_going="$5" dry_run="$6"
+
+    local staging_dir="${workdir}/sync-staging"
+    mkdir -p "$staging_dir"
+
+    echo "==> Synchronisation depuis ${config} (skopeo sync)..." >&2
+    local -a sync_args=(sync --src yaml --dest dir --scoped)
+    [[ "$keep_going" == "true" ]] && sync_args+=(--keep-going)
+    [[ "$dry_run" == "true" ]] && sync_args+=(--dry-run)
+    sync_args+=("$config" "$staging_dir")
+    skopeo "${sync_args[@]}" >&2
+
+    if [[ "$dry_run" == "true" ]]; then
+        return 2
+    fi
+
+    mkdir -p "$v2_root"
+    local -A processed_digests=()
+    local manifest_json leaf_dir rel image_full tag normalized_image digest_hex
+    local n_tags=0 n_failed=0
+
+    while IFS= read -r manifest_json; do
+        leaf_dir="$(dirname "$manifest_json")"
+        rel="${leaf_dir#"$staging_dir"/}"
+        image_full="${rel%:*}"
+        tag="${rel##*:}"
+
+        if [[ -z "$image_full" || "$image_full" == "$rel" ]]; then
+            echo "    Ignoré (chemin de sortie skopeo sync inattendu) : ${rel}" >&2
+            n_failed=$((n_failed + 1))
+            continue
+        fi
+
+        normalized_image="$(normalize_image_name "$image_full")"
+        echo "    - ${normalized_image}:${tag}" >&2
+        if ! convert_skopeo_dir_to_v2 "$leaf_dir" "$normalized_image" "$tag" "$v2_root"; then
+            n_failed=$((n_failed + 1))
+            continue
+        fi
+        n_tags=$((n_tags + 1))
+        digest_hex="$(sha256sum "$manifest_json" | cut -d' ' -f1)"
+        printf '%s\t%s\t%s\n' "$normalized_image" "$tag" "$digest_hex"
+
+        if [[ "$with_signatures" == "true" ]]; then
+            local dedup_key="${normalized_image}@${digest_hex}"
+            if [[ -z "${processed_digests[$dedup_key]:-}" ]]; then
+                processed_digests["$dedup_key"]=1
+                local sanitized_key="${dedup_key//[:@\/]/_}"
+                local companion companion_dir suffix source_ref="docker://${normalized_image}"
+                for suffix in sig att sbom; do
+                    companion="sha256-${digest_hex}.${suffix}"
+                    companion_dir="${workdir}/cosign-${sanitized_key}-${suffix}"
+                    if try_pull_cosign_tag "$source_ref" "$normalized_image" "$companion" "$v2_root" "$companion_dir"; then
+                        echo "      trouvé : ${companion}" >&2
+                    fi
+                done
+                local ref_workdir="${workdir}/refs-${sanitized_key}"
+                mkdir -p "$ref_workdir"
+                if pull_oci_referrers_fallback "$source_ref" "$normalized_image" "$digest_hex" "$v2_root" "$ref_workdir"; then
+                    echo "      trouvé : index de referrers" >&2
+                fi
+            fi
+        fi
+    done < <(find "$staging_dir" -type f -name manifest.json | sort)
+
+    echo "==> ${n_tags} tag(s) synchronisé(s)$( [[ $n_failed -gt 0 ]] && printf ', %d échec(s)' "$n_failed" )." >&2
+    return 0
+}
+
+# ===========================================================================
 # Génération de la configuration Apache — traduction fidèle en bash de
 # gen-apache2.sh (fourni par l'utilisateur) :
 #   - copie error.json dans v2/
@@ -1212,9 +1306,11 @@ usage_pull() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz] [options]
    ou: ${SCRIPT_NAME} pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-dir DIR
+   ou: ${SCRIPT_NAME} pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
 
-Options obligatoires :
-  -i, --image IMAGE          Nom de l'image (ex: alpine, library/nginx)
+Options obligatoires (un seul des deux modes) :
+  -i, --image IMAGE          Mode image unique. Nom de l'image (ex: alpine,
+                               library/nginx).
   -t, --tag TAG              Tag à télécharger (ex: latest, 1.2.3)
   -d, --digest DIGEST        Digest exact à télécharger (avec ou sans préfixe
                                "sha256:"), ex: sha256:abcd... ou juste abcd...
@@ -1223,6 +1319,18 @@ Options obligatoires :
                                le digest précise EXACTEMENT quel contenu
                                télécharger, et le tag sert en plus à créer un
                                pointeur de tag local sur ce même contenu.
+  -c, --config FICHIER        Mode multi-images/tags (incompatible avec
+                               -i/-t/-d/--from-dir) : synchronise (via
+                               'skopeo sync', même fichier YAML que la
+                               commande '${SCRIPT_NAME} mirror') une sélection
+                               de tags issue de plusieurs images/registres, et
+                               les empaquette TOUS dans une seule archive --
+                               pratique pour préparer un transfert vers une
+                               machine air-gapped, à 'upload'er là-bas ensuite.
+                               --arch/--os/--source/--no-expand sont ignorées
+                               dans ce mode (portées par le fichier de config).
+                               Voir '${SCRIPT_NAME} mirror --help' pour le
+                               format du fichier.
 
 Options :
   -o, --output ARCHIVE       Chemin de l'archive tar.gz à produire. Si omis, un nom
@@ -1252,10 +1360,15 @@ Options :
                                premier '/', ou "localhost" — n'est jamais modifié).
                                Uniquement appliqué quand --source vaut "docker://".
       --keep-workdir          Ne pas supprimer le répertoire de travail temporaire
+      --keep-going             Mode -c/--config uniquement : transmis à
+                                 'skopeo sync --keep-going' (ne s'arrête pas
+                                 si un des tags listés est introuvable/en échec)
 
 Signatures et SBOM (cosign) — voir aussi '${SCRIPT_NAME} --help' :
       --with-signatures        Recherche et embarque (via skopeo, en plus de
-                                 l'image) les artefacts cosign associés :
+                                 l'image ou, en mode -c/--config, de CHAQUE tag
+                                 synchronisé -- une seule fois par digest
+                                 partagé) les artefacts cosign associés :
                                  signature (sha256-<digest>.sig), attestation
                                  (.att, peut contenir un SBOM CycloneDX),
                                  SBOM legacy (.sbom), et le repli statique OCI
@@ -1267,10 +1380,11 @@ Signatures et SBOM (cosign) — voir aussi '${SCRIPT_NAME} --help' :
                                  combiner avec les options --*-from-dir
                                  ci-dessous pour rester 100% offline).
       --sig-from-dir DIR        Équivalent 100% offline pour la signature
-                                 seule : DIR est un répertoire "skopeo dir:"
-                                 déjà produit pour le tag sha256-<digest>.sig
-                                 correspondant à cette image (le digest de
-                                 l'image venant d'être téléchargée/convertie).
+                                 seule (mode -i uniquement) : DIR est un
+                                 répertoire "skopeo dir:" déjà produit pour le
+                                 tag sha256-<digest>.sig correspondant à cette
+                                 image (le digest de l'image venant d'être
+                                 téléchargée/convertie).
       --att-from-dir DIR        Idem pour l'attestation (.att).
       --sbom-from-dir DIR       Idem pour le SBOM legacy (.sbom).
 
@@ -1283,13 +1397,15 @@ Exemples :
   ${SCRIPT_NAME} pull -i alpine -t 3.20 --arch all               # -> alpine-3.20-all.tar.gz
   ${SCRIPT_NAME} pull -i alpine -t 3.20 -o custom.tar.gz --from-dir /tmp/skopeo-alpine
   ${SCRIPT_NAME} pull -i alpine -t 3.20 --with-signatures        # embarque signature/attestation/SBOM si présentes
+  ${SCRIPT_NAME} pull -c sync.yaml -o mirror.tar.gz              # plusieurs images/tags dans une seule archive
+  ${SCRIPT_NAME} pull -c sync.yaml --with-signatures              # idem, + artefacts cosign de chaque tag
 EOF
 }
 
 cmd_pull() {
-    local image="" tag="" digest="" output="" gpg_key="" from_dir=""
+    local image="" tag="" digest="" output="" gpg_key="" from_dir="" config=""
     local source_prefix="docker://" arch="amd64" os="linux" keep_workdir="false" no_expand="false"
-    local with_signatures="false" sig_from_dir="" att_from_dir="" sbom_from_dir=""
+    local with_signatures="false" sig_from_dir="" att_from_dir="" sbom_from_dir="" keep_going="false"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1298,12 +1414,14 @@ cmd_pull() {
             -d|--digest) digest="$2"; shift 2 ;;
             -o|--output) output="$2"; shift 2 ;;
             -k|--gpg-key) gpg_key="$2"; shift 2 ;;
+            -c|--config) config="$2"; shift 2 ;;
             --from-dir) from_dir="$2"; shift 2 ;;
             --source) source_prefix="$2"; shift 2 ;;
             --arch) arch="$2"; shift 2 ;;
             --os) os="$2"; shift 2 ;;
             --no-expand) no_expand="true"; shift ;;
             --keep-workdir) keep_workdir="true"; shift ;;
+            --keep-going) keep_going="true"; shift ;;
             --with-signatures) with_signatures="true"; shift ;;
             --sig-from-dir) sig_from_dir="$2"; shift 2 ;;
             --att-from-dir) att_from_dir="$2"; shift 2 ;;
@@ -1312,6 +1430,89 @@ cmd_pull() {
             *) echo "Option inconnue pour 'pull' : $1" >&2; exit 1 ;;
         esac
     done
+
+    if [[ -n "$config" ]]; then
+        if [[ -n "$image" || -n "$tag" || -n "$digest" || -n "$from_dir" ]]; then
+            echo "Erreur : -c/--config est incompatible avec -i/-t/-d/--from-dir." >&2
+            usage_pull
+            exit 1
+        fi
+        [[ -f "$config" ]] || { echo "Erreur : fichier de config introuvable : $config" >&2; exit 1; }
+        command -v skopeo >/dev/null 2>&1 || { echo "Erreur : 'skopeo' est requis pour -c/--config." >&2; exit 1; }
+        for bin in tar sha256sum; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "Erreur : '$bin' est requis mais introuvable." >&2; exit 1; }
+        done
+        if [[ -n "$gpg_key" ]]; then
+            command -v gpg >/dev/null 2>&1 || { echo "Erreur : 'gpg' est requis pour signer mais introuvable." >&2; exit 1; }
+        fi
+
+        if [[ -z "$output" ]]; then
+            local sanitized_config
+            sanitized_config="$(basename "$config" | tr '/: ' '---')"
+            output="${sanitized_config%.*}-mirror.tar.gz"
+            echo "==> Nom de fichier généré automatiquement : ${output}"
+        fi
+
+        local workdir
+        workdir="$(mktemp -d "/tmp/registry-cli-pull.XXXXXX")"
+        if [[ "$keep_workdir" == "true" ]]; then
+            trap 'echo "Répertoire de travail conservé : '"$workdir"'"' EXIT
+        else
+            trap 'rm -rf "'"$workdir"'"' EXIT
+        fi
+
+        local v2_root="${workdir}/v2"
+        local sync_output=""
+        sync_output="$(sync_yaml_into_v2 "$config" "$v2_root" "$workdir" "$with_signatures" "$keep_going" "false")"
+
+        local n_tags=0
+        [[ -n "$sync_output" ]] && n_tags="$(printf '%s\n' "$sync_output" | grep -c .)"
+        if [[ "$n_tags" -eq 0 ]]; then
+            echo "Erreur : aucun tag synchronisé depuis ${config} -- archive non produite." >&2
+            exit 1
+        fi
+
+        local created_at
+        created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        {
+            printf '{\n  "config": "%s",\n  "created_at": "%s",\n  "tool": "registry-cli.sh pull --config",\n  "images": [\n' \
+                "$(escape_json_string "$config")" "$created_at"
+            local first="true" line_image line_tag line_digest
+            while IFS=$'\t' read -r line_image line_tag line_digest; do
+                [[ "$first" == "true" ]] || printf ',\n'
+                first="false"
+                printf '    {"image": "%s", "tag": "%s", "digest": "sha256:%s"}' \
+                    "$(escape_json_string "$line_image")" "$(escape_json_string "$line_tag")" "$line_digest"
+            done <<< "$sync_output"
+            printf '\n  ]\n}\n'
+        } > "${workdir}/registrish-archive.json"
+
+        mkdir -p "$(dirname "$output")" 2>/dev/null || true
+        echo "==> Création de l'archive ${output}..."
+        tar -C "$workdir" -czf "$output" v2 registrish-archive.json
+
+        echo "==> Calcul du SHA256..."
+        sha256sum "$output" > "${output}.sha256"
+        echo "    $(cat "${output}.sha256")"
+
+        if [[ -n "$gpg_key" ]]; then
+            echo "==> Signature GPG avec la clé ${gpg_key}..."
+            gpg --batch --yes --local-user "$gpg_key" \
+                --armor --detach-sign --output "${output}.asc" "$output"
+            echo "    Signature écrite dans ${output}.asc"
+        else
+            echo "==> Aucune clé GPG fournie : archive non signée."
+        fi
+
+        echo "==> Terminé."
+        echo "    ${n_tags} tag(s) inclus dans l'archive."
+        echo "    Archive : ${output}"
+        echo "    SHA256  : ${output}.sha256"
+        if [[ -n "$gpg_key" ]]; then
+            echo "    Signature : ${output}.asc"
+        fi
+        return 0
+    fi
 
     [[ -z "$image" ]] && { echo "Erreur : -i/--image est obligatoire." >&2; usage_pull; exit 1; }
 
@@ -1596,71 +1797,19 @@ cmd_mirror() {
         trap 'rm -rf "'"$workdir"'"' EXIT
     fi
 
-    local staging_dir="${workdir}/staging"
-    mkdir -p "$staging_dir"
+    local v2_root="${root}/v2"
+    local sync_output="" sync_status=0
+    sync_output="$(sync_yaml_into_v2 "$config" "$v2_root" "$workdir" "$with_signatures" "$keep_going" "$dry_run")" || sync_status=$?
 
-    echo "==> Synchronisation depuis ${config} (skopeo sync)..."
-    local -a sync_args=(sync --src yaml --dest dir --scoped)
-    [[ "$keep_going" == "true" ]] && sync_args+=(--keep-going)
-    [[ "$dry_run" == "true" ]] && sync_args+=(--dry-run)
-    sync_args+=("$config" "$staging_dir")
-    skopeo "${sync_args[@]}"
-
-    if [[ "$dry_run" == "true" ]]; then
+    if [[ $sync_status -eq 2 ]]; then
         echo "==> --dry-run : aucune modification apportée à ${root}."
         exit 0
+    elif [[ $sync_status -ne 0 ]]; then
+        exit "$sync_status"
     fi
 
-    echo "==> Fusion des tags synchronisés dans ${root}/v2..."
-    local v2_root="${root}/v2"
-    mkdir -p "$v2_root"
-
-    local -A processed_digests=()
-    local manifest_json leaf_dir rel image_full tag normalized_image digest_hex
-    local n_tags=0 n_failed=0
-
-    while IFS= read -r manifest_json; do
-        leaf_dir="$(dirname "$manifest_json")"
-        rel="${leaf_dir#"$staging_dir"/}"
-        image_full="${rel%:*}"
-        tag="${rel##*:}"
-
-        if [[ -z "$image_full" || "$image_full" == "$rel" ]]; then
-            echo "    Ignoré (chemin de sortie skopeo sync inattendu) : ${rel}" >&2
-            n_failed=$((n_failed + 1))
-            continue
-        fi
-
-        normalized_image="$(normalize_image_name "$image_full")"
-        echo "    - ${normalized_image}:${tag}"
-        if ! convert_skopeo_dir_to_v2 "$leaf_dir" "$normalized_image" "$tag" "$v2_root"; then
-            n_failed=$((n_failed + 1))
-            continue
-        fi
-        n_tags=$((n_tags + 1))
-
-        if [[ "$with_signatures" == "true" ]]; then
-            digest_hex="$(sha256sum "$manifest_json" | cut -d' ' -f1)"
-            local dedup_key="${normalized_image}@${digest_hex}"
-            if [[ -z "${processed_digests[$dedup_key]:-}" ]]; then
-                processed_digests["$dedup_key"]=1
-                local sanitized_key="${dedup_key//[:@\/]/_}"
-                local companion companion_dir suffix source_ref="docker://${normalized_image}"
-                for suffix in sig att sbom; do
-                    companion="sha256-${digest_hex}.${suffix}"
-                    companion_dir="${workdir}/cosign-${sanitized_key}-${suffix}"
-                    if try_pull_cosign_tag "$source_ref" "$normalized_image" "$companion" "$v2_root" "$companion_dir"; then
-                        echo "      trouvé : ${companion}"
-                    fi
-                done
-                local ref_workdir="${workdir}/refs-${sanitized_key}"
-                mkdir -p "$ref_workdir"
-                if pull_oci_referrers_fallback "$source_ref" "$normalized_image" "$digest_hex" "$v2_root" "$ref_workdir"; then
-                    echo "      trouvé : index de referrers"
-                fi
-            fi
-        fi
-    done < <(find "$staging_dir" -type f -name manifest.json | sort)
+    local n_tags=0
+    [[ -n "$sync_output" ]] && n_tags="$(printf '%s\n' "$sync_output" | grep -c .)"
 
     if [[ "$regen_config" == "true" ]]; then
         echo "==> Régénération de v2/.htaccess..."
@@ -1671,9 +1820,6 @@ cmd_mirror() {
 
     echo
     echo "==> Terminé : ${n_tags} tag(s) mirroré(s)."
-    if [[ $n_failed -gt 0 ]]; then
-        echo "    ${n_failed} tag(s) en échec (voir messages ci-dessus)."
-    fi
 }
 
 # ===========================================================================
@@ -2571,7 +2717,7 @@ _registry_cli_complete() {
     local opts=""
     case "$cmd" in
         pull)
-            opts="-i --image -t --tag -d --digest -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
+            opts="-i --image -t --tag -d --digest -c --config -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir --keep-going --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
             ;;
         mirror)
             opts="-c --config -r --registry-root --with-signatures --keep-going --dry-run --regen-config --no-regen-config --keep-workdir -h --help"
