@@ -1,0 +1,82 @@
+name: RPM build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - registry-cli.sh
+      - man/**
+      - packaging/rpm/**
+      - .github/workflows/rpm.yml
+  pull_request:
+    paths:
+      - registry-cli.sh
+      - man/**
+      - packaging/rpm/**
+      - .github/workflows/rpm.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & smoke-test on AlmaLinux ${{ matrix.almalinux }}
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:${{ matrix.almalinux }}
+    strategy:
+      fail-fast: false
+      matrix:
+        almalinux: ['9', '10']
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y git rpm-build rpmdevtools jq rsync gnupg2 man-db util-linux
+
+      - uses: actions/checkout@v4
+
+      - name: Read package version from the script
+        id: version
+        run: |
+          version="$(grep -oP 'REGISTRY_CLI_VERSION="\K[^"]+' registry-cli.sh)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build source tarball
+        run: |
+          set -euo pipefail
+          pkgdir="registry-cli-${{ steps.version.outputs.version }}"
+          mkdir -p "/tmp/src/${pkgdir}"
+          cp registry-cli.sh README.md LICENSE "/tmp/src/${pkgdir}/"
+          cp -r man "/tmp/src/${pkgdir}/"
+          tar -C /tmp/src -czf "/tmp/src/${pkgdir}.tar.gz" "${pkgdir}"
+
+      - name: rpmbuild
+        run: |
+          set -euo pipefail
+          rpmdev-setuptree
+          cp "/tmp/src/registry-cli-${{ steps.version.outputs.version }}.tar.gz" ~/rpmbuild/SOURCES/
+          cp packaging/rpm/registry-cli.spec ~/rpmbuild/SPECS/
+          rpmbuild -bb ~/rpmbuild/SPECS/registry-cli.spec
+
+      - name: Install the built RPM
+        run: |
+          set -euo pipefail
+          rpm_file="$(find ~/rpmbuild/RPMS -name '*.rpm')"
+          echo "rpm_file=${rpm_file}" >> "$GITHUB_ENV"
+          dnf install -y "${rpm_file}"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          registry-cli --version
+          for cmd in pull mirror upload list remove gc index verify sbom completion; do
+            registry-cli "$cmd" --help >/dev/null
+          done
+          MANWIDTH=80 man registry-cli | grep -q "manage a static"
+          LC_ALL=C.UTF-8 MANWIDTH=80 man -L fr registry-cli | grep -q "gérer une registry"
+          test -f /usr/share/bash-completion/completions/registry-cli
+
+      - name: Upload built RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-cli-el${{ matrix.almalinux }}.rpm
+          path: ${{ env.rpm_file }}

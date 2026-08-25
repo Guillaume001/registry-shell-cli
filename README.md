@@ -63,6 +63,39 @@ chmod +x registry-cli.sh
 sudo cp registry-cli.sh /usr/local/bin/registry-cli
 ```
 
+### Paquet RPM (AlmaLinux 9 / 10)
+
+Un `.spec` (`packaging/rpm/registry-cli.spec`) et une CI GitHub Actions
+(`.github/workflows/rpm.yml`) construisent et testent un paquet `noarch`
+sur AlmaLinux 9 et 10 à chaque push touchant le script, les pages man ou le
+`.spec`. Dépendances fortes : `bash`, `rsync`, `jq`. Dépendances faibles
+(`Recommends`, non bloquantes) : `skopeo`, `gnupg2`, `cosign` — nécessaires
+seulement pour certaines fonctionnalités (voir la section DEPENDENCIES des
+pages man). Le paquet installe le binaire sous `/usr/bin/registry-cli`, les
+pages man anglaise et française, et la complétion bash.
+
+Construction locale (sur une machine RPM, ou via un conteneur AlmaLinux) :
+
+```bash
+version="$(grep -oP 'REGISTRY_CLI_VERSION="\K[^"]+' registry-cli.sh)"
+pkgdir="registry-cli-${version}"
+mkdir -p "/tmp/src/${pkgdir}"
+cp registry-cli.sh README.md LICENSE "/tmp/src/${pkgdir}/"
+cp -r man "/tmp/src/${pkgdir}/"
+tar -C /tmp/src -czf "/tmp/src/${pkgdir}.tar.gz" "${pkgdir}"
+rpmdev-setuptree
+cp "/tmp/src/${pkgdir}.tar.gz" ~/rpmbuild/SOURCES/
+cp packaging/rpm/registry-cli.spec ~/rpmbuild/SPECS/
+rpmbuild -bb ~/rpmbuild/SPECS/registry-cli.spec
+```
+
+### Pages de manuel
+
+```bash
+man man/registry-cli.1              # anglais
+man man/fr/registry-cli.1           # français
+```
+
 ## Auto-complétion
 
 `registry-cli.sh` est un **fichier unique et auto-suffisant** : la

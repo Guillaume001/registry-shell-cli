@@ -1,0 +1,611 @@
+.TH REGISTRY-CLI 1 "2026-08-25" "registry-cli 1.0.0" "registry-cli manual"
+.SH NAME
+registry-cli \- manage a static "registrish" Docker/OCI registry
+.SH SYNOPSIS
+.B registry-cli
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B registry-cli
+is a single, fully self-contained (offline-capable) Bash script that manages
+a static Docker/OCI registry in the
+.B registrish
+layout (see
+.UR https://github.com/jpetazzo/registrish
+.UE ):
+a plain
+.I v2/<image>/{blobs,manifests}
+directory tree that can be served by any static file host \(em Apache2,
+NGINX, Netlify, S3, and so on. It never clones a remote repository and does
+not depend on any external script: the conversion logic and the Apache
+configuration generator are faithful Bash translations of the original
+.I dir2reg.sh
+and
+.I gen-apache2.sh
+scripts from the
+.I jpetazzo/registrish
+repository.
+.PP
+The tool works with two independent representations of a registry:
+.IP \(bu 3
+a portable
+.B .tar.gz
+archive (produced by
+.B pull
+and consumed by
+.BR upload ),
+suitable for transferring images to an air-gapped machine;
+.IP \(bu 3
+a live, on-disk
+.B REGISTRY_ROOT
+directory (containing
+.IR v2/ ,
+.I error.json
+and
+.IR index.html ),
+which
+.BR upload ", " remove ", " gc ", " mirror " and " index
+operate on directly, in place.
+.SH COMMANDS
+.B registry-cli
+takes a single subcommand as its first argument, followed by
+subcommand-specific options. Every subcommand accepts
+.B \-h
+or
+.B \-\-help
+for its full usage text.
+.SS "pull \- download an image and produce an archive"
+.RS
+.B registry-cli pull \-i
+.I IMAGE
+.B "(\-t"
+.I TAG
+.B "| \-d"
+.IR DIGEST ")"
+.RI [ options ]
+.br
+.B registry-cli pull \-c
+.I CONFIG.yaml
+.RI [ options ]
+.RE
+.PP
+Downloads one image (single-image mode, using
+.BR skopeo )
+and packages it as a
+.B .tar.gz
+archive, or, in multi-image mode
+.RB ( \-c / \-\-config ),
+synchronizes a whole selection of images/tags described by a
+.B skopeo sync
+YAML config file (the same format used by
+.BR mirror (1))
+and bundles all of them into a single archive \(em handy for staging a
+transfer to an air-gapped machine, to be
+.B upload
+ed there afterwards.
+.TP
+.BR \-i ", " \-\-image " " \fIIMAGE\fR
+Single-image mode. Image name (e.g.
+.IR alpine ,
+.IR library/nginx ).
+Short names are expanded to their canonical long form by default (e.g.
+.I alpine
+becomes
+.IR docker.io/library/alpine ),
+unless
+.B \-\-no\-expand
+is given.
+.TP
+.BR \-t ", " \-\-tag " " \fITAG\fR
+Tag to download. At least one of
+.B \-t
+/
+.B \-d
+is required in single-image mode (unless
+.BR \-\-from\-dir
+is used). Both may be combined: the digest pins the exact content, while
+the tag additionally creates a local tag pointer to that same content.
+.TP
+.BR \-d ", " \-\-digest " " \fIDIGEST\fR
+Exact digest to download, with or without the
+.I sha256:
+prefix.
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Multi-image mode (mutually exclusive with
+.BR \-i / \-t / \-d / \-\-from\-dir ).
+.B \-\-arch
+/
+.B \-\-os
+/
+.B \-\-source
+/
+.B \-\-no\-expand
+are ignored in this mode (carried by the config file itself instead). If
+.B \-o
+is omitted, the archive is named
+.IR CONFIG\-mirror.tar.gz .
+.TP
+.BR \-o ", " \-\-output " " \fIARCHIVE\fR
+Path of the
+.B .tar.gz
+archive to produce. If omitted in single-image mode, a name is generated
+automatically:
+.IR IMAGE\-LABEL\-ARCH.tar.gz .
+.TP
+.BR \-k ", " \-\-gpg\-key " " \fIKEY_ID\fR
+Sign the archive with this GPG key (default: unsigned).
+.TP
+.BI \-\-from\-dir " DIR"
+Use a directory already produced by
+.I "skopeo copy ... dir:DIR"
+instead of invoking skopeo \(em enables a fully offline workflow: download
+with skopeo on a connected machine, transfer the directory, then package it
+here without any network access.
+.TP
+.BI \-\-source " docker://..."
+Skopeo source prefix (default:
+.IR docker:// ).
+.TP
+.BI \-\-arch " ARCH"
+Platform architecture to download (default:
+.IR amd64 ,
+a single platform).
+.B \-\-arch all
+fetches every platform available in a multi-arch manifest list.
+.TP
+.BI \-\-os " OS"
+Operating system, used together with
+.B \-\-arch
+(default:
+.IR linux ;
+ignored with
+.IR "\-\-arch all" ).
+.TP
+.B \-\-no\-expand
+Do not expand
+.B \-i
+/
+.B \-\-image
+to its canonical long form.
+.TP
+.B \-\-keep\-workdir
+Do not delete the temporary working directory (debugging aid).
+.TP
+.B \-\-keep\-going
+Multi-image mode only: passed through to
+.IR "skopeo sync \-\-keep\-going" .
+.TP
+.B \-\-with\-signatures
+Look up and bundle, in addition to the image itself (or, in
+.B \-c
+mode, every synchronized tag, deduplicated by digest), the associated
+cosign artifacts: signature
+.RI ( sha256\-<digest>.sig ),
+attestation
+.RI ( .att ,
+may embed a CycloneDX SBOM), legacy SBOM
+.RI ( .sbom ),
+and the static OCI 1.1 "referrers" fallback. Missing artifacts are silently
+skipped. Requires
+.BR skopeo .
+.TP
+.BR \-\-sig\-from\-dir " " \fIDIR\fR ", " \-\-att\-from\-dir " " \fIDIR\fR ", " \-\-sbom\-from\-dir " " \fIDIR\fR
+Fully offline, per-artifact equivalents (single-image mode only): each
+.I DIR
+is a
+.I "skopeo dir:"
+output already produced for the matching companion tag.
+.SS "mirror \- synchronize several images/tags into a live registry, in place"
+.RS
+.B registry-cli mirror \-c
+.I CONFIG.yaml
+.B \-r
+.I REGISTRY_ROOT
+.RI [ options ]
+.RE
+.PP
+Unlike
+.B pull
+(one archive per invocation, uploaded separately),
+.B mirror
+relies on
+.B skopeo sync
+to fetch, in one command, a selection of tags spanning several
+images/registries, and merges them directly \(em in place, additively,
+deduplicated by digest, just like
+.BR upload
+\(em into a registry that is already being served. Designed to be run
+periodically (cron) to keep moving tags such as
+.I latest
+up to date without re-downloading unchanged content.
+.TP
+.BR \-c ", " \-\-config " " \fIFILE\fR
+Required. YAML file for
+.IR "skopeo sync \-\-src yaml" .
+Passed through to skopeo verbatim, not interpreted by
+.BR registry-cli .
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required. Registry root to update in place.
+.TP
+.B \-\-with\-signatures
+Also fetch, for every synchronized tag, its associated cosign artifacts
+(deduplicated by digest). Disabled by default.
+.TP
+.B \-\-keep\-going
+Passed through to
+.IR "skopeo sync \-\-keep\-going" .
+.TP
+.B \-\-dry\-run
+Passed through to
+.IR "skopeo sync \-\-dry\-run" :
+writes nothing to
+.IR REGISTRY_ROOT .
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Regenerate
+.I v2/.htaccess
+and
+.I index.html
+after the merge. Enabled by default.
+.TP
+.B \-\-keep\-workdir
+Do not delete the temporary working directory.
+.PP
+Example config file:
+.RS
+.EX
+docker.io:
+  images:
+    library/alpine:
+      \- "3.20"
+      \- "latest"
+quay.io:
+  images:
+    coreos/etcd:
+      \- latest
+.EE
+.RE
+.SS "upload \- place an archive into a registry"
+.RS
+.B registry-cli upload \-a
+.I ARCHIVE
+.B \-r
+.I REGISTRY_ROOT
+.RI [ options ]
+.RE
+.PP
+Verifies the archive (checksum, and GPG signature if present), extracts it,
+then merges its files
+.RI ( v2/blobs/... ", " v2/manifests/... )
+into those already present under
+.IR REGISTRY_ROOT/v2 ,
+without deleting anything existing.
+.TP
+.BR \-a ", " \-\-archive " " \fIARCHIVE\fR
+Required.
+.B .tar.gz
+archive produced by
+.BR pull .
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required. Registry filesystem root.
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Regenerate
+.I v2/.htaccess
+after merging. Enabled by default.
+.TP
+.B \-\-require\-signature
+Fail if the archive has no
+.I .asc
+signature.
+.TP
+.B \-\-skip\-checksum
+Do not verify the associated
+.I .sha256
+file.
+.TP
+.BI \-\-gpg\-keyring " FILE"
+Public-key file imported into a temporary keyring for signature
+verification.
+.SS "list \- inventory of a registry"
+.RS
+.B registry-cli list \-r
+.I REGISTRY_ROOT
+.RB [ \-\-json ]
+.RE
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required.
+.TP
+.B \-\-json
+Emit a JSON array instead of a text table.
+.SS "remove \- delete a tag, a digest, or a whole image"
+.RS
+.B registry-cli remove \-r
+.I REGISTRY_ROOT
+.B \-\-image
+.I IMAGE
+.RB [ \-\-tag
+.I TAG
+.B "| \-\-digest"
+.IR DIGEST ]
+.RI [ options ]
+.RE
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required.
+.TP
+.BI \-\-image " IMAGE"
+Required. Looked up as given first, then, if not found, under its
+canonical long name.
+.TP
+.BI \-\-tag " TAG"
+Tag to delete.
+.TP
+.BI \-\-digest " DIGEST"
+Exact digest to delete, targeting
+.I manifests/sha256:xxx
+directly. Mutually exclusive with
+.BR \-\-tag .
+If neither
+.B \-\-tag
+nor
+.B \-\-digest
+is given, the
+.B whole image
+is deleted.
+.TP
+.BR \-\-gc " / " \-\-no\-gc
+Clean up this image's manifests/blobs that became orphaned (blobs are
+stored per image, so this never affects other images). Enabled by default.
+.TP
+.BR \-\-purge\-if\-empty " / " \-\-no\-purge\-if\-empty
+If no tag remains after deletion, also remove the image directory. Enabled
+by default.
+.TP
+.BR \-y ", " \-\-yes
+Do not prompt for confirmation.
+.TP
+.B \-\-dry\-run
+Simulate the operation without deleting anything.
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Regenerate
+.I v2/.htaccess
+after deletion. Enabled by default.
+.SS "gc \- clean up the whole registry (orphaned manifests/blobs)"
+.RS
+.B registry-cli gc \-r
+.I REGISTRY_ROOT
+.RI [ options ]
+.RE
+.PP
+Like
+.IR "remove \-\-gc" ,
+but across the
+.B entire
+registry in a single command, without deleting any tag: walks every image
+under
+.I v2/
+and removes manifests/blobs that are no longer reachable from any tag.
+Nothing still reachable \(em including cosign companion artifacts
+.RI ( .sig / .att / .sbom /
+referrers) \(em is ever touched. Meant for routine, periodic (cron) use, or
+after several
+.IR "remove \-\-no\-gc" .
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required.
+.TP
+.BR \-\-purge\-empty\-images " / " \-\-no\-purge\-empty\-images
+Also remove the directory of images left with no tag at all (an unusual
+situation, usually caused by manual tampering with the registry). Disabled
+by default.
+.TP
+.BR \-y ", " \-\-yes
+Do not prompt for confirmation.
+.TP
+.B \-\-dry\-run
+Simulate the cleanup without deleting anything.
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Regenerate
+.I v2/.htaccess
+after cleanup. Enabled by default.
+.SS "index \- (re)generate the registry's HTML dashboard"
+.RS
+.B registry-cli index \-r
+.I REGISTRY_ROOT
+.RE
+.PP
+Regenerates only the
+.I index.html
+page at the registry root (a self-contained static dashboard of available
+images/tags/architectures), without touching anything else. Useful after a
+manual change to the registry, or to generate it for the first time.
+Automatically regenerated by
+.B upload
+and
+.B remove
+unless
+.B \-\-no\-regen\-config
+is given.
+.SS "verify \- check a cosign signature"
+.RS
+.B registry-cli verify \-u
+.I REGISTRY_URL
+.B \-i
+.I IMAGE
+.B "(\-t"
+.I TAG
+.B "| \-d"
+.IR DIGEST ") \-k"
+.I PUBLIC_KEY
+.RI [ options ]
+.RB [ \-\-
+.IR "COSIGN_ARGS..." ]
+.RE
+.PP
+Unlike every other subcommand,
+.B verify
+never touches a local path: cosign speaks the OCI Distribution HTTP
+protocol, so its target must be the URL where
+.I v2/
+is actually
+.B served
+(Apache2), not the local filesystem root. Deliberately limited to
+public-key verification (no keyless Rekor/Fulcio mode), the only mode
+compatible with fully offline use.
+.TP
+.BR \-u ", " \-\-registry\-url " " \fIHOST[:PORT]\fR
+Required. Host of the registry as served over HTTP(S).
+.TP
+.BR \-i ", " \-\-image " " \fIIMAGE\fR
+Required.
+.TP
+.BR \-t ", " \-\-tag " " \fITAG\fR " | " \-d ", " \-\-digest " " \fIDIGEST\fR
+Reference to verify (mutually exclusive).
+.TP
+.BR \-k ", " \-\-key " " \fIFILE\fR
+Required. Cosign public key
+.RI ( cosign.pub ).
+.TP
+.B \-\-no\-expand
+Do not expand
+.B \-i
+/
+.B \-\-image
+to its canonical long form.
+.TP
+.BI \-\- " COSIGN_ARGS..."
+Extra cosign arguments passed through verbatim at the end of the command
+line.
+.SS "sbom \- extract a cosign-attested CycloneDX SBOM"
+.RS
+.B registry-cli sbom \-u
+.I REGISTRY_URL
+.B \-i
+.I IMAGE
+.B "(\-t"
+.I TAG
+.B "| \-d"
+.IR DIGEST ")"
+.RI [ options ]
+.RB [ \-\-
+.IR "COSIGN_ARGS..." ]
+.RE
+.TP
+.BR \-u ", " \-\-registry\-url " " \fIHOST[:PORT]\fR ", " \-i ", " \-\-image " " \fIIMAGE\fR ", " \-t / \-d
+Same as
+.BR verify .
+.TP
+.BR \-k ", " \-\-key " " \fIFILE\fR
+If given, the attestation is
+.B verified
+.RI ( "cosign verify\-attestation" )
+before extraction. Without
+.BR \-k ,
+the attestation is only
+.B downloaded without any verification
+.RI ( "cosign download attestation" )
+\(em for inspection only, not to be trusted.
+.TP
+.BI \-\-type " TYPE"
+In-toto predicate type to target (default:
+.IR cyclonedx ).
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Output file (default: stdout).
+.TP
+.B \-\-no\-expand
+Do not expand
+.B \-i
+/
+.B \-\-image
+to its canonical long form.
+.TP
+.BI \-\- " COSIGN_ARGS..."
+Extra cosign arguments passed through verbatim.
+.PP
+Requires
+.B jq
+(mandatory, no grep/sed fallback: correctly decoding a nested base64 DSSE
+envelope without risking corrupting the SBOM needs a real JSON parser). If
+several attestations of the same type exist for the image, only the first
+one is extracted.
+.SS "completion \- print the bash completion script"
+.RS
+.B registry-cli completion
+.RE
+.PP
+Prints a bash completion script to stdout. Temporary use:
+.IR "source <(registry-cli completion)" .
+Permanent install:
+.IR "registry-cli completion > /etc/bash_completion.d/registry-cli" .
+.SH FILES
+.TP
+.I REGISTRY_ROOT/v2/<image>/manifests/
+Tag files (plain copies of the manifest JSON) and content-addressed
+.I sha256:<digest>
+canonical manifests.
+.TP
+.I REGISTRY_ROOT/v2/<image>/blobs/
+Content-addressed
+.I sha256:<digest>
+layer/config blobs.
+.TP
+.IR REGISTRY_ROOT/v2/.htaccess " , " REGISTRY_ROOT/v2/error.json
+Apache2 configuration generated by
+.BR upload / remove / gc / mirror / index
+(see the "Serving the registry with Apache2" section of the project
+README).
+.TP
+.I REGISTRY_ROOT/index.html
+Self-contained static HTML dashboard, regenerated by the same commands.
+.SH EXIT STATUS
+.B 0
+on success,
+.B 1
+on any error (invalid arguments, missing dependency, network/skopeo
+failure, checksum/signature mismatch, and so on).
+.SH DEPENDENCIES
+Hard requirements: a POSIX shell toolchain
+.RI ( bash ", " tar ", " sha256sum ", " find ", " grep ", " sed ),
+.B rsync
+(used by
+.BR upload " to merge archives), and " jq
+(used throughout for JSON parsing; a grep/sed fallback exists for most
+operations but is not used by
+.BR sbom ,
+which requires
+.BR jq ).
+Optional, feature-gated dependencies:
+.B skopeo
+(required by
+.BR pull / mirror
+whenever network access is used, i.e. without
+.BR \-\-from\-dir ),
+.B gpg
+(archive signing/verification), and
+.B cosign
+(required by
+.BR verify " and " sbom ).
+.SH SEE ALSO
+.BR skopeo (1),
+.BR skopeo\-sync (1),
+.BR skopeo\-copy (1),
+.BR cosign (1),
+.BR gpg (1),
+.BR rsync (1),
+.BR jq (1)
+.PP
+Project homepage and full documentation:
+.UR https://github.com/Guillaume001/registry-shell-cli
+.UE
+.SH AUTHOR
+Guillaume COURS and contributors.
+.SH LICENSE
+GNU General Public License v3.0 or later.

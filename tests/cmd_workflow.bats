@@ -196,6 +196,15 @@ setup() {
     [[ "$output" == *"registry-cli.sh version"* ]]
 }
 
+@test "--version reflète le nom sous lequel le script est invoqué (utile une fois installé en paquet sous 'registry-cli')" {
+    local renamed="${BATS_TEST_TMPDIR}/registry-cli"
+    cp "$REGISTRY_CLI" "$renamed"
+    chmod +x "$renamed"
+    run "$renamed" --version
+    [ "$status" -eq 0 ]
+    [[ "$output" == "registry-cli version "* ]]
+}
+
 @test "commande inconnue affiche l'usage et échoue" {
     run "$REGISTRY_CLI" bogus-command
     [ "$status" -ne 0 ]

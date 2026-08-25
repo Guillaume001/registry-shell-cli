@@ -2854,7 +2854,7 @@ COMPLETION_EOF
 # ---------------------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     if [[ "${1:-}" == "--version" ]]; then
-        echo "registry-cli.sh version ${REGISTRY_CLI_VERSION}"
+        echo "${SCRIPT_NAME} version ${REGISTRY_CLI_VERSION}"
         exit 0
     fi
 
