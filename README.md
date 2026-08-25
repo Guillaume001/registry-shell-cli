@@ -28,6 +28,7 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
 - [Signatures et SBOM (cosign)](#signatures-et-sbom-cosign)
 - [Format de l'archive](#format-de-larchive)
 - [Structure de la registry produite](#structure-de-la-registry-produite)
+- [⚠️ Servir la registry avec Apache2](#servir-la-registry-avec-apache2)
 - [Workflows type](#workflows-type)
 - [Notes et limites connues](#notes-et-limites-connues)
 
@@ -505,6 +506,52 @@ curl -sI http://localhost:8000/v2/<image>/manifests/<tag>
 En production, préférez une image Apache dédiée (Dockerfile avec
 `AllowOverride All` dans un vhost, ou config équivalente sur un Apache
 "nu") plutôt que ces `-c` en ligne de commande.
+
+### `mod_mime_magic` (courant sur RHEL/CentOS) : une limite que `.htaccess` ne peut pas lever
+
+Même avec `AllowOverride All` correctement actif, un blob peut encore être
+livré avec un `Content-Encoding` fantaisiste (ex : `x-gzip`, un alias non
+standard que ni Go — utilisé par podman/skopeo/docker — ni leur propre
+détection de compression ne reconnaissent). Résultat côté client :
+`podman --log-level debug pull` affiche `No compression detected` /
+`Using original blob without modification`, puis échoue avec `Digest did
+not match`, alors que le fichier sur disque est parfaitement intact
+(vérifiable avec `curl` : voir plus bas).
+
+**Cause** : nos fichiers de blobs n'ont pas d'extension. Si `mod_mime_magic`
+est chargé côté serveur (activé par défaut sur certaines distributions,
+notamment RHEL/CentOS — moins souvent sur Debian/Ubuntu ou l'image `httpd`
+officielle), il *renifle* le contenu de ces fichiers et leur attribue lui
+-même un `Content-Type`/`Content-Encoding` mal aligné avec ce que les
+clients registry attendent. C'est une **limite structurelle** de cette
+approche "que des fichiers statiques + `.htaccess`" : `mod_mime_magic`
+fixe le `Content-Encoding` via un mécanisme interne à Apache que **aucune
+directive de `.htaccess` ne peut retirer** (`Header unset`/`Header always
+unset Content-Encoding` inclus — vérifié). Seule une modification de la
+configuration serveur/`VirtualHost` fonctionne :
+
+```apache
+<VirtualHost *:8000>
+    DocumentRoot /srv/registrish
+    MIMEMagicFile none
+    ...
+</VirtualHost>
+```
+
+(ou, plus radicalement, ne pas charger le module du tout —
+`LoadModule mime_magic_module modules/mod_mime_magic.so` en commentaire).
+
+Diagnostic pour confirmer que c'est bien ce cas précis :
+
+```bash
+curl -sI http://localhost:8000/v2/<image>/blobs/sha256:<digest>
+# Content-Encoding présent (ex: x-gzip) → c'est ce problème.
+
+curl -s http://localhost:8000/v2/<image>/blobs/sha256:<digest> | sha256sum
+sha256sum /chemin/vers/la/registry/v2/<image>/blobs/sha256:<digest>
+# Les deux correspondent → le fichier sur disque n'est PAS en cause,
+# seule l'étiquette HTTP ment.
+```
 
 ## Workflows type
 
