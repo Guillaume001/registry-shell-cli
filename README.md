@@ -23,10 +23,13 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
   - [list](#list--inventaire-de-la-registry)
   - [remove](#remove--supprimer-un-tag-un-digest-ou-une-image)
   - [gc](#gc--nettoyer-toute-la-registry-manifestsblobs-orphelins)
+  - [sign](#sign--signervérifier-les-manifests-dune-registry-avec-gpg)
   - [index](#index--page-daccueil-html-de-la-registry)
   - [verify](#verify--vérifier-une-signature-cosign)
   - [sbom](#sbom--extraire-un-sbom-cyclonedx)
   - [completion](#auto-complétion)
+- [Signatures GPG par manifest](#signatures-gpg-par-manifest)
+- [Transfert par rsync (pull --to-dir / upload --from-dir)](#transfert-par-rsync-pull---to-dir--upload---from-dir)
 - [Signatures et SBOM (cosign)](#signatures-et-sbom-cosign)
 - [Format de l'archive](#format-de-larchive)
 - [Structure de la registry produite](#structure-de-la-registry-produite)
@@ -41,7 +44,7 @@ de `dir2reg.sh` et `gen-apache2.sh` du dépôt `jpetazzo/registrish`.
 | `bash`      | tout                                                       | oui                              |
 | `tar`, `sha256sum`, `grep`, `sed`, `find` | tout                                   | oui (présents sur tout Linux)   |
 | `skopeo`    | `pull` sans `--from-dir`                                   | non si `--from-dir` utilisé     |
-| `gpg`       | signer (`pull -k`) ou vérifier une signature (`upload`)    | non si pas de signature en jeu  |
+| `gpg`       | signer (`pull -k`, `sign -k`) ou vérifier des signatures de manifests (`upload`, `sign --check`) | non si pas de signature en jeu  |
 | `rsync`     | `upload` (fusion des fichiers)                              | non — repli automatique sur `cp -a` |
 | `jq`        | `upload`/`remove` (lecture du `mediaType` des manifestes)   | non — repli automatique par `grep`/`sed` (sauf `sbom`, voir ci-dessous) |
 | `column`    | `list` (affichage en tableau aligné)                        | non — repli par `awk`           |
@@ -136,8 +139,10 @@ programme nommé `registry-cli.sh`, `registry-cli`, ou `./registry-cli.sh`.
 - **Archive** : un `.tar.gz` produit par `pull`, contenant une arborescence
   `v2/<image>/{blobs,manifests}` prête à fusionner dans une registry, plus
   un fichier `registrish-archive.json` de métadonnées (image, tag, digest,
-  architecture, date). Toujours accompagnée d'un `.sha256`, et
-  optionnellement d'une signature GPG détachée (`.asc`).
+  architecture, date). Toujours accompagnée d'un `.sha256`. Si `-k` est
+  fourni, chaque manifest canonique qu'elle contient est signé
+  individuellement (`v2/.../manifests/sha256:<hex>.asc`) — voir
+  [Signatures GPG par manifest](#signatures-gpg-par-manifest).
 - **Registry** : un répertoire filesystem (`REGISTRY_ROOT`) contenant
   `v2/<image>/{blobs,manifests}` pour une ou plusieurs images, plus
   `v2/error.json` et des fichiers `.htaccess` pour Apache2.
@@ -176,9 +181,9 @@ programme nommé `registry-cli.sh`, `registry-cli`, ou `./registry-cli.sh`.
 ### `pull` — télécharger une image et produire une archive
 
 ```
-registry-cli.sh pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz] [options]
-registry-cli.sh pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-dir DIR
-registry-cli.sh pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
+registry-cli.sh pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz | --to-dir DIR] [options]
+registry-cli.sh pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz | --to-dir DIR] --from-dir DIR
+registry-cli.sh pull -c CONFIG.yaml [-o ARCHIVE.tar.gz | --to-dir DIR] [options]
 ```
 
 **Mode image unique** (`-i`) :
@@ -188,8 +193,9 @@ registry-cli.sh pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
 | `-i`, `--image IMAGE` | **Obligatoire.** Nom de l'image (ex: `alpine`, `library/nginx`). |
 | `-t`, `--tag TAG` | Tag à télécharger. Requis si `-d` n'est pas fourni (sauf avec `--from-dir`). |
 | `-d`, `--digest DIGEST` | Digest exact à télécharger, avec ou sans préfixe `sha256:`. Peut être combiné avec `-t` : le digest précise le contenu exact, le tag crée en plus un pointeur local sur ce contenu. |
-| `-o`, `--output ARCHIVE` | Chemin de l'archive à produire. **Si omis**, généré automatiquement : `IMAGE-LABEL-ARCH.tar.gz` (`LABEL` = tag, ou 12 premiers caractères du digest si pas de tag ; `/` de l'image remplacés par `-`). |
-| `-k`, `--gpg-key KEY_ID` | Signe l'archive avec cette clé GPG (`gpg --detach-sign --armor`). Par défaut : pas de signature. |
+| `-o`, `--output ARCHIVE` | Chemin de l'archive à produire. **Si omis** (et sans `--to-dir`), généré automatiquement : `IMAGE-LABEL-ARCH.tar.gz` (`LABEL` = tag, ou 12 premiers caractères du digest si pas de tag ; `/` de l'image remplacés par `-`). Incompatible avec `--to-dir`. |
+| `--to-dir DIR` | Au lieu d'une archive, fusionne directement (fichiers en clair, additif, idempotent) dans `DIR/v2`. Pensé pour un transfert par `rsync` minimisant les fichiers transférés. Voir [Transfert par rsync](#transfert-par-rsync-pull---to-dir--upload---from-dir). Incompatible avec `-o`. |
+| `-k`, `--gpg-key KEY_ID` | Signe chaque manifest **canonique** produit avec cette clé GPG (`gpg --detach-sign --armor`, un `.asc` par manifest, jamais re-signé si déjà signé). Voir [Signatures GPG par manifest](#signatures-gpg-par-manifest). Par défaut : pas de signature. |
 | `--from-dir DIR` | Utilise un répertoire déjà produit par `skopeo copy ... dir:DIR` au lieu d'appeler skopeo — permet un usage 100% offline (téléchargez sur une machine connectée, transférez le répertoire, packagez ici). |
 | `--source docker://...` | Préfixe de source skopeo. Défaut : `docker://`. |
 | `--arch ARCH` | Architecture à télécharger (`amd64`, `arm64`, `arm`, `386`, `ppc64le`, `s390x`...). **Défaut : `amd64`** (une seule plateforme). `--arch all` récupère toutes les plateformes disponibles (manifest-list multi-arch). |
@@ -202,7 +208,7 @@ registry-cli.sh pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
 
 | Option | Description |
 |---|---|
-| `-c`, `--config FICHIER` | **Obligatoire** (dans ce mode). Même fichier YAML `skopeo sync --src yaml` que [`mirror`](#mirror--synchroniser-plusieurs-imagestags-en-place-skopeo-sync). Synchronise tous les tags qu'il liste et les empaquette **tous dans une seule archive** — pratique pour préparer un transfert vers une machine air-gapped, à `upload`er là-bas ensuite. `-o`, `-k`, `--keep-workdir` et `--with-signatures` restent valables ; `--arch`/`--os`/`--source`/`--no-expand` sont ignorées (portées par le fichier de config). |
+| `-c`, `--config FICHIER` | **Obligatoire** (dans ce mode). Même fichier YAML `skopeo sync --src yaml` que [`mirror`](#mirror--synchroniser-plusieurs-imagestags-en-place-skopeo-sync). Synchronise tous les tags qu'il liste et les empaquette **tous dans une seule archive**, ou les fusionne dans `--to-dir DIR` si donné — pratique pour préparer un transfert vers une machine air-gapped ou par `rsync`, à `upload`er là-bas ensuite. `-o`/`--to-dir`, `-k`, `--keep-workdir` et `--with-signatures` restent valables ; `--arch`/`--os`/`--source`/`--no-expand` sont ignorées (portées par le fichier de config). |
 | `--keep-going` | Transmis à `skopeo sync --keep-going` : ne s'arrête pas si un des tags listés est introuvable/en échec. |
 
 Nom d'archive **si `-o` est omis** en mode `-c` : `CONFIG-mirror.tar.gz` (basename du
@@ -215,7 +221,7 @@ registry-cli.sh pull -i alpine -t 3.20
 #   -> alpine-3.20-amd64.tar.gz
 
 registry-cli.sh pull -i alpine -t 3.20 -k 0xDEADBEEF
-#   archive signée GPG
+#   chaque manifest canonique de l'archive est signé GPG individuellement
 
 registry-cli.sh pull -i alpine -t 3.20 --arch arm64
 #   -> alpine-3.20-arm64.tar.gz
@@ -306,21 +312,28 @@ registry-cli.sh mirror -c sync.yaml -r /srv/registrish --dry-run
 
 ```
 registry-cli.sh upload -a ARCHIVE -r REGISTRY_ROOT [options]
+registry-cli.sh upload --from-dir DIR -r REGISTRY_ROOT [options]
 ```
+
+Une des deux sources est obligatoire, mutuellement exclusives :
 
 | Option | Description |
 |---|---|
-| `-a`, `--archive ARCHIVE` | **Obligatoire.** Archive `.tar.gz` produite par `pull`. |
+| `-a`, `--archive ARCHIVE` | Archive `.tar.gz` produite par `pull`. |
+| `--from-dir DIR` | Répertoire déjà produit par `pull --to-dir DIR` (ou `mirror`), transféré tel quel (ex: `rsync`). Voir [Transfert par rsync](#transfert-par-rsync-pull---to-dir--upload---from-dir). |
+
+| Option | Description |
+|---|---|
 | `-r`, `--registry-root DIR` | **Obligatoire.** Racine filesystem de la registry cible. |
 | `--regen-config` / `--no-regen-config` | Régénère `v2/.htaccess`, `v2/error.json` et les `.htaccess` par image après l'ajout. **Activé par défaut.** |
-| `--require-signature` | Échoue si l'archive n'a pas de signature `.asc` à côté d'elle. |
-| `--skip-checksum` | Ne vérifie pas le fichier `.sha256` associé. |
-| `--gpg-keyring FICHIER` | Trousseau de clés publiques (`gpg --export`) à importer temporairement pour la vérification, au lieu d'utiliser votre trousseau GPG personnel. |
+| `--require-signature` | Échoue si la source (archive ou répertoire) ne contient aucun manifest signé (`.asc`). |
+| `--skip-checksum` | Ne vérifie pas le fichier `.sha256` associé. Mode `-a` uniquement ; sans effet avec `--from-dir`. |
+| `--gpg-keyring FICHIER` | Trousseau de clés publiques (`gpg --export`) à importer temporairement pour la vérification des manifests signés, au lieu d'utiliser votre trousseau GPG personnel. |
 
 **Vérifications effectuées, dans l'ordre :**
-1. Checksum SHA256 de l'archive (si `ARCHIVE.sha256` existe, sauf `--skip-checksum`).
-2. Signature GPG (si `ARCHIVE.asc` existe) — la vérification échoue et bloque l'upload si la signature est invalide. Si aucune signature n'est présente, l'upload continue sauf si `--require-signature` est donné.
-3. Extraction, puis **fusion** (`rsync -a`, ou `cp -a` en repli) dans `REGISTRY_ROOT/v2/` — rien d'existant n'est écrasé ou supprimé.
+1. Avec `-a` : checksum SHA256 de l'archive (si `ARCHIVE.sha256` existe, sauf `--skip-checksum`), puis extraction. Avec `--from-dir` : aucune (le répertoire est utilisé directement, en lecture seule).
+2. Signature GPG de chaque manifest canonique signé (`.asc` trouvé à côté de lui) — la vérification échoue et bloque l'upload (rien n'est fusionné) si l'une d'elles est invalide. `--require-signature` exige qu'au moins un manifest signé soit présent.
+3. **Fusion** (`rsync -a`, ou `cp -a` en repli) dans `REGISTRY_ROOT/v2/` — rien d'existant n'est écrasé ou supprimé.
 4. Régénération de la configuration Apache (sauf `--no-regen-config`).
 
 **Exemples :**
@@ -329,6 +342,9 @@ registry-cli.sh upload -a ARCHIVE -r REGISTRY_ROOT [options]
 registry-cli.sh upload -a alpine-3.20-amd64.tar.gz -r /srv/registrish
 
 registry-cli.sh upload -a alpine-3.20-amd64.tar.gz -r /srv/registrish \
+    --require-signature --gpg-keyring ./trusted-keys.asc
+
+registry-cli.sh upload --from-dir /var/lib/registry-incoming -r /srv/registrish \
     --require-signature --gpg-keyring ./trusted-keys.asc
 ```
 
@@ -411,9 +427,11 @@ Comme `remove --gc`, mais sur **toute** la registry en une seule commande, sans
 supprimer aucun tag : parcourt chaque image sous `v2/` et retire les
 manifestes/blobs devenus orphelins (plus référencés par aucun tag). Rien de
 ce qui reste atteignable depuis un tag — y compris les artefacts cosign
-compagnons (`.sig`/`.att`/`.sbom`/repli referrers) — n'est jamais touché.
-Pensé pour un usage périodique (cron) de routine, ou après plusieurs
-`remove --no-gc`.
+compagnons (`.sig`/`.att`/`.sbom`/repli referrers) — n'est jamais touché. Un
+manifest signé (`.asc`, voir [`sign`](#sign--signervérifier-les-manifests-dune-registry-avec-gpg))
+est traité comme faisant partie du manifest lui-même : conservé tant que le
+manifest est atteignable, supprimé avec lui sinon. Pensé pour un usage
+périodique (cron) de routine, ou après plusieurs `remove --no-gc`.
 
 | Option | Description |
 |---|---|
@@ -437,6 +455,46 @@ registry-cli.sh gc -r /srv/registrish -y
 
 ```cron
 0 3 * * 0  /opt/registry-cli.sh gc -r /srv/registrish -y >> /var/log/registrish-gc.log 2>&1
+```
+
+### `sign` — signer/vérifier les manifests d'une registry avec GPG
+
+```
+registry-cli.sh sign -r REGISTRY_ROOT (-k KEY_ID | --check) [options]
+```
+
+Signe (ou vérifie) rétroactivement, avec GPG, chaque manifest **canonique**
+d'une registry déjà en place — utile pour signer du contenu ajouté par
+`mirror` (qui n'appelle pas GPG lui-même), après une rotation de clé, ou
+pour un contrôle d'intégrité périodique. Voir [Signatures GPG par
+manifest](#signatures-gpg-par-manifest) pour le principe général.
+
+| Option | Description |
+|---|---|
+| `-r`, `--registry-root DIR` | **Obligatoire.** |
+| `-k`, `--gpg-key KEY_ID` | Signe chaque manifest canonique non encore signé avec cette clé. |
+| `--check` | Ne signe rien : vérifie les `.asc` déjà présents (échoue net si l'un d'eux est invalide). Incompatible avec `-k`. |
+| `-i`, `--image IMAGE` | Limite l'opération à cette image (chemin sous `v2/`, ex : `library/alpine`). Répétable. Par défaut : toute la registry. |
+| `--gpg-keyring FICHIER` | Trousseau de clés publiques pour `--check`, au lieu du trousseau GPG personnel. |
+| `--force` | Re-signe même les manifests déjà signés (après rotation de clé). Sans effet avec `--check`. |
+| `--dry-run` | Affiche ce qui serait signé/vérifié sans rien écrire. |
+| `-y`, `--yes` | Ne demande pas de confirmation. |
+| `--regen-config` / `--no-regen-config` | Régénère la config Apache après signature. **Activé par défaut.** |
+
+**Exemples :**
+
+```bash
+# Signature initiale (idempotente : ne re-signe pas ce qui l'est déjà)
+registry-cli.sh sign -r /srv/registrish -k 0xDEADBEEF -y
+
+# Limité à une image
+registry-cli.sh sign -r /srv/registrish -k 0xDEADBEEF -y -i library/alpine
+
+# Contrôle d'intégrité périodique (CI/cron), avec le trousseau public de l'équipe
+registry-cli.sh sign -r /srv/registrish --check --gpg-keyring team-pubkeys.asc
+
+# Après rotation de clé : re-signe tout avec la nouvelle clé
+registry-cli.sh sign -r /srv/registrish -k 0xNEWKEY --force -y
 ```
 
 ### `index` — page d'accueil HTML de la registry
@@ -552,6 +610,121 @@ registry-cli.sh sbom -u registry.example.com -i alpine -t 3.20 \
     -k cosign.pub -o alpine-3.20.cdx.json
 ```
 
+## Signatures GPG par manifest
+
+`pull -k KEY_ID` et [`sign -k`](#sign--signervérifier-les-manifests-dune-registry-avec-gpg)
+signent GPG chaque manifest **canonique** individuellement
+(`v2/<image>/manifests/sha256:<hex>.asc`, détaché, armored) — jamais
+l'archive dans son ensemble, jamais un tag (pointeur mutable), jamais un
+blob (déjà content-addressed, donc son intégrité découle de celle du
+manifest qui le référence par digest). C'est le même principe que les
+signatures cosign (voir plus bas) : signer par digest de contenu, pas par
+nom.
+
+**Pourquoi pas signer l'archive entière ?** Une archive régénérée à
+l'identique produit malgré tout un `.tar.gz` différent d'un run à l'autre
+(métadonnées tar, ordre, horodatages), donc une signature d'archive globale
+invalide systématiquement tout le paquet au moindre changement — y compris
+quand la quasi-totalité du contenu (les blobs, souvent l'essentiel du poids)
+est strictement inchangée. En signant au grain du manifest et en la
+stockant à demeure dans `v2/`, seul le delta réel (un manifest modifié + son
+`.asc`, tous deux petits) a besoin d'être re-transféré — un `rsync -a` d'une
+arborescence `v2/` déjà signée vers un miroir ne retransfère jamais les
+blobs ni les manifests inchangés.
+
+`upload` vérifie automatiquement chaque manifest signé trouvé dans une
+archive avant de le fusionner (voir [`upload`](#upload--placer-une-archive-dans-la-registry)) ;
+`gc` et `remove --gc` traitent un `.asc` comme partie intégrante de son
+manifest (jamais supprimé isolément, jamais laissé orphelin) ; `sign --check`
+permet un contrôle d'intégrité périodique indépendant de tout déploiement.
+
+**Bonnes pratiques :**
+- Utilisez une **sous-clé de signature dédiée** pour l'automatisation
+  (`gpg --quick-add-key`), pas la clé maître — une sous-clé se révoque et se
+  fait tourner sans invalider votre identité GPG.
+- Pour un usage non interactif, préférez une clé sans passphrase dans un
+  `GNUPGHOME` dédié à l'automatisation, ou un `gpg-agent` déjà déverrouillé ;
+  le script appelle `gpg --batch --yes` et ne gère pas d'invite de
+  passphrase lui-même.
+- Après une rotation de clé, `sign -k NOUVELLE_CLE --force` re-signe tout ;
+  les anciennes signatures `.asc` sont simplement écrasées (elles ne sont
+  pas conservées en plus).
+
+**Point de migration :** les archives produites par une version antérieure
+de `registry-cli.sh` étaient signées au niveau de l'archive entière
+(`ARCHIVE.tar.gz.asc`). Ce fichier n'est plus reconnu ni vérifié par
+`upload` — les archives déjà signées doivent être re-`pull`ées pour obtenir
+des manifests signés individuellement.
+
+## Transfert par rsync (`pull --to-dir` / `upload --from-dir`)
+
+Scénario cible : une machine A a accès réseau et exécute `pull` (une image ou
+plusieurs via `-c`) périodiquement (cron) ; une machine B, qui n'a **aucun**
+accès réseau sortant, sert la registry aux clients internes. Le transfert
+entre les deux se fait par `rsync` (SSH), et doit rester **minimal** : ne
+retransférer que ce qui a réellement changé, jamais relire/rechiffrer des
+blobs déjà présents côté B.
+
+Le mode archive (`pull -o ARCHIVE.tar.gz`) ne convient **pas** à ce scénario :
+un `.tar.gz` change intégralement d'un run à l'autre (horodatages tar, ordre
+des entrées, ré-compression gzip), même si son contenu logique n'a pas
+bougé — `rsync` de l'archive retransfère donc quasiment tout, à chaque fois,
+quel que soit le delta réel.
+
+`--to-dir`/`--from-dir` résolvent ça en gardant l'échange **en fichiers
+individuels, content-addressed**, exactement comme le reste de la registry :
+
+1. **Machine A**, périodiquement (cron) :
+   ```bash
+   registry-cli.sh pull -c sync.yaml --to-dir /var/lib/registry-staging -k 0xDEADBEEF -y
+   ```
+   `--to-dir` fusionne le résultat directement dans `/var/lib/registry-staging/v2`
+   (fichiers en clair, pas d'archive), de façon **additive et idempotente** :
+   un tag/blob déjà présent n'est jamais réécrit, et un manifest déjà signé
+   n'est **jamais re-signé** (une signature GPG n'est pas déterministe —
+   la re-signer produirait un `.asc` different à chaque run, et donc un
+   nouveau transfert inutile). `/var/lib/registry-staging` n'est **pas** une
+   registry servable (pas de `.htaccess`/`index.html` générés) : c'est un
+   point de staging pur, à transférer.
+
+2. **Transfert A → B**, périodiquement (cron, juste après le `pull`) :
+   ```bash
+   rsync -a --delete /var/lib/registry-staging/ machine-b:/var/lib/registry-incoming/
+   ```
+   Comme le contenu est content-addressed et stable d'un run à l'autre, seuls
+   les fichiers réellement nouveaux ou modifiés sont transférés — les blobs
+   (souvent l'essentiel du volume) et les manifests déjà signés ne bougent
+   pas. `--delete` est optionnel : à activer si la machine A elle-même
+   nettoie régulièrement `/var/lib/registry-staging` (ex: via `gc`) et que
+   ce nettoyage doit se répercuter côté B.
+
+3. **Machine B**, après chaque transfert :
+   ```bash
+   registry-cli.sh upload --from-dir /var/lib/registry-incoming -r /srv/registrish \
+       --require-signature --gpg-keyring team-pubkeys.asc
+   ```
+   Vérifie la signature GPG de chaque manifest présent (abandonne sans rien
+   fusionner si l'une est invalide — voir [`upload`](#upload--placer-une-archive-dans-la-registry)),
+   puis fusionne dans `REGISTRY_ROOT/v2` exactement comme pour une archive.
+   `/var/lib/registry-incoming` n'est jamais modifié par `upload` (lecture
+   seule).
+
+**Bonnes pratiques pour ce flux :**
+- Toujours `-k` côté A et `--require-signature --gpg-keyring` côté B : sans
+  ça, `rsync`/SSH garantit l'intégrité du *transport* mais rien ne garantit
+  que le contenu déposé dans `/var/lib/registry-staging` sur A est légitime
+  (ni ne détecte une modification faite directement sur B avant l'`upload`).
+  La signature GPG par manifest est ce qui apporte la garantie de bout en
+  bout, indépendamment du transport.
+- `rsync` via SSH (`machine-b:...`) apporte confidentialité et intégrité du
+  transport lui-même ; la signature GPG reste nécessaire en plus, car elle
+  couvre aussi l'intégrité du **contenu** (avant/après le transport, pas
+  seulement pendant).
+- Limitez les droits du compte SSH utilisé pour le `rsync` à
+  `/var/lib/registry-incoming` uniquement (ex: `rrsync`, ou une clé SSH avec
+  `command=` restreint dans `authorized_keys`) — B n'a besoin de rien
+  d'autre depuis A.
+
 ## Signatures et SBOM (cosign)
 
 `pull --with-signatures` (ou `--sig-from-dir`/`--att-from-dir`/`--sbom-from-dir`
@@ -587,13 +760,13 @@ registry-cli.sh sbom -u registry.example.com -i alpine -t 3.20 -k cosign.pub
 
 ```
 ARCHIVE.tar.gz
-├── v2/<image>/manifests/sha256:<digest>   # manifeste canonique
-├── v2/<image>/manifests/<tag>             # copie nommée par tag (si -t donné)
-├── v2/<image>/blobs/sha256:<digest>       # config + layers
-└── registrish-archive.json                # métadonnées : image, tag, digest,
-                                            #   arch, created_at, tool, source
-ARCHIVE.tar.gz.sha256                      # toujours généré
-ARCHIVE.tar.gz.asc                         # si -k/--gpg-key fourni
+├── v2/<image>/manifests/sha256:<digest>       # manifeste canonique
+├── v2/<image>/manifests/sha256:<digest>.asc   # sa signature GPG, si -k/--gpg-key fourni
+├── v2/<image>/manifests/<tag>                 # copie nommée par tag (si -t donné)
+├── v2/<image>/blobs/sha256:<digest>           # config + layers
+└── registrish-archive.json                    # métadonnées : image, tag, digest,
+                                                #   arch, created_at, tool, source
+ARCHIVE.tar.gz.sha256                          # toujours généré
 ```
 
 ## Structure de la registry produite
@@ -608,7 +781,8 @@ REGISTRY_ROOT/
         ├── manifests/
         │   ├── .htaccess          # ForceType + Docker-Content-Digest par fichier
         │   ├── <tag>               # copie du manifeste nommée par tag
-        │   └── sha256:<digest>     # copie canonique nommée par digest
+        │   ├── sha256:<digest>     # copie canonique nommée par digest
+        │   └── sha256:<digest>.asc # sa signature GPG (si signé, voir 'sign'/'pull -k')
         └── blobs/
             └── sha256:<digest>     # config JSON + layers (pas de .htaccess)
 ```
@@ -709,10 +883,34 @@ sha256sum /chemin/vers/la/registry/v2/<image>/blobs/sha256:<digest>
 **Signature et vérification GPG de bout en bout :**
 
 ```bash
+# Chaque manifest canonique de l'archive est signé individuellement
 registry-cli.sh pull -i alpine -t 3.20 -k 0xDEADBEEF
+
+# upload vérifie les manifests signés trouvés, refuse la fusion s'il n'y en a aucun
 registry-cli.sh upload -a alpine-3.20-amd64.tar.gz -r /srv/registrish \
-    --require-signature
+    --require-signature --gpg-keyring team-pubkeys.asc
+
+# Contrôle d'intégrité périodique, indépendant de tout déploiement
+registry-cli.sh sign -r /srv/registrish --check --gpg-keyring team-pubkeys.asc
+
+# Signer rétroactivement du contenu déjà présent (ex: ajouté par 'mirror')
+registry-cli.sh sign -r /srv/registrish -k 0xDEADBEEF -y
 ```
+
+**Synchronisation périodique par rsync entre une machine de pull et une machine de service (transfert minimal, signé) :**
+
+```bash
+# Machine A (accès réseau), en cron, ex. toutes les heures :
+registry-cli.sh pull -c sync.yaml --to-dir /var/lib/registry-staging -k 0xDEADBEEF -y
+rsync -a /var/lib/registry-staging/ machine-b:/var/lib/registry-incoming/
+
+# Machine B (pas d'accès réseau sortant), en cron, juste après :
+registry-cli.sh upload --from-dir /var/lib/registry-incoming -r /srv/registrish \
+    --require-signature --gpg-keyring team-pubkeys.asc
+```
+
+Voir [Transfert par rsync](#transfert-par-rsync-pull---to-dir--upload---from-dir)
+pour le détail (pourquoi pas une archive, bonnes pratiques de bout en bout).
 
 **Air-gapped (aucun accès réseau sur la machine cible) :**
 

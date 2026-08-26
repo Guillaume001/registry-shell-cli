@@ -44,7 +44,7 @@ directory (containing
 and
 .IR index.html ),
 which
-.BR upload ", " remove ", " gc ", " mirror " and " index
+.BR upload ", " remove ", " gc ", " sign ", " mirror " and " index
 operate on directly, in place.
 .SH COMMANDS
 .B registry-cli
@@ -129,12 +129,31 @@ is omitted, the archive is named
 .BR \-o ", " \-\-output " " \fIARCHIVE\fR
 Path of the
 .B .tar.gz
-archive to produce. If omitted in single-image mode, a name is generated
-automatically:
+archive to produce. If omitted in single-image mode (and without
+.BR \-\-to\-dir ),
+a name is generated automatically:
 .IR IMAGE\-LABEL\-ARCH.tar.gz .
+Mutually exclusive with
+.BR \-\-to\-dir .
+.TP
+.BI \-\-to\-dir " DIR"
+Instead of an archive, merge the result directly (plain files, additive,
+idempotent) into
+.IR DIR/v2 .
+Meant to be transferred by
+.B rsync
+with a minimal diff, then ingested with
+.BR "upload \-\-from\-dir" .
+Mutually exclusive with
+.BR \-o .
 .TP
 .BR \-k ", " \-\-gpg\-key " " \fIKEY_ID\fR
-Sign the archive with this GPG key (default: unsigned).
+Sign each canonical manifest produced with this GPG key, one detached
+.I .asc
+file per manifest (not a single archive-wide signature; already-signed
+manifests are never re-signed; default: unsigned). See the
+.B sign
+command below.
 .TP
 .BI \-\-from\-dir " DIR"
 Use a directory already produced by
@@ -274,20 +293,43 @@ quay.io:
 .B \-r
 .I REGISTRY_ROOT
 .RI [ options ]
+.br
+.B "registry-cli upload \-\-from\-dir"
+.I DIR
+.B \-r
+.I REGISTRY_ROOT
+.RI [ options ]
 .RE
 .PP
-Verifies the archive (checksum, and GPG signature if present), extracts it,
-then merges its files
+Verifies the source's checksum (archive mode only), extracts it (archive
+mode), or reads it directly with
+.B \-\-from\-dir
+(read-only), verifies the GPG signature of every signed canonical manifest
+it contains (fails and merges nothing if any is invalid), then merges its
+files
 .RI ( v2/blobs/... ", " v2/manifests/... )
 into those already present under
 .IR REGISTRY_ROOT/v2 ,
 without deleting anything existing.
 .TP
 .BR \-a ", " \-\-archive " " \fIARCHIVE\fR
-Required.
 .B .tar.gz
 archive produced by
 .BR pull .
+Mutually exclusive with
+.BR \-\-from\-dir ;
+exactly one of the two is required.
+.TP
+.BI \-\-from\-dir " DIR"
+Directory already produced by
+.B "pull \-\-to\-dir"
+(or
+.BR mirror ),
+transferred here as-is (e.g.
+.BR rsync ).
+Contains
+.I v2/...
+directly, no archive.
 .TP
 .BR \-r ", " \-\-registry\-root " " \fIDIR\fR
 Required. Registry filesystem root.
@@ -298,9 +340,8 @@ Regenerate
 after merging. Enabled by default.
 .TP
 .B \-\-require\-signature
-Fail if the archive has no
-.I .asc
-signature.
+Fail if the archive contains no signed manifest
+.RI ( .asc ).
 .TP
 .B \-\-skip\-checksum
 Do not verify the associated
@@ -308,7 +349,7 @@ Do not verify the associated
 file.
 .TP
 .BI \-\-gpg\-keyring " FILE"
-Public-key file imported into a temporary keyring for signature
+Public-key file imported into a temporary keyring for manifest signature
 verification.
 .SS "list \- inventory of a registry"
 .RS
@@ -415,6 +456,68 @@ Simulate the cleanup without deleting anything.
 Regenerate
 .I v2/.htaccess
 after cleanup. Enabled by default.
+.SS "sign \- sign/verify a registry's manifests with GPG"
+.RS
+.B registry-cli sign \-r
+.I REGISTRY_ROOT
+.RB ( \-k
+.I KEY_ID
+.RB "| " \-\-check ")"
+.RI [ options ]
+.RE
+.PP
+Signs (or verifies) each
+.B canonical
+manifest of an already-deployed registry with GPG, one manifest at a time.
+Never touches blobs, tag copies, or cosign companion artifacts \(em only
+the manifests themselves are signed, which keeps re-signing or later
+additions cheap to
+.BR rsync .
+Useful to sign content added by
+.B mirror
+(which does not call GPG itself), after a key rotation, or for periodic
+integrity checks.
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Required.
+.TP
+.BR \-k ", " \-\-gpg\-key " " \fIKEY_ID\fR
+Sign every canonical manifest not yet signed with this GPG key.
+.TP
+.B \-\-check
+Sign nothing: verify the
+.I .asc
+files already present (fail hard if any is invalid). Mutually exclusive
+with
+.BR \-k .
+.TP
+.BR \-i ", " \-\-image " " \fIIMAGE\fR
+Restrict the operation to this image (path under
+.IR v2/ ,
+e.g.
+.IR library/alpine ).
+Repeatable. Default: the whole registry.
+.TP
+.BI \-\-gpg\-keyring " FILE"
+Public-key file imported into a temporary keyring for
+.BR \-\-check ,
+instead of the user's default GPG keyring.
+.TP
+.B \-\-force
+Re-sign manifests that are already signed (e.g. after a key rotation). No
+effect with
+.BR \-\-check .
+.TP
+.B \-\-dry\-run
+Show what would be signed/verified without writing anything.
+.TP
+.BR \-y ", " \-\-yes
+Do not prompt for confirmation.
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Regenerate
+.I v2/.htaccess
+after signing. Enabled by default.
 .SS "index \- (re)generate the registry's HTML dashboard"
 .RS
 .B registry-cli index \-r

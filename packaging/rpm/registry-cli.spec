@@ -1,5 +1,5 @@
 Name:           registry-cli
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Self-contained CLI to manage a static "registrish" Docker/OCI registry
 
@@ -51,7 +51,7 @@ install -Dm0644 %{name}.bash-completion %{buildroot}%{_datadir}/bash-completion/
 bash -n %{name}.sh
 ./%{name}.sh --version
 ./%{name}.sh --help >/dev/null
-for cmd in pull mirror upload list remove gc index verify sbom completion; do
+for cmd in pull mirror upload list remove gc sign index verify sbom completion; do
     ./%{name}.sh "$cmd" --help >/dev/null
 done
 
@@ -64,5 +64,14 @@ done
 %{_datadir}/bash-completion/completions/%{name}
 
 %changelog
+* Wed Aug 26 2026 Guillaume COURS <15053338+Guillaume001@users.noreply.github.com> - 1.1.0-1
+- Signature GPG par manifest (pull -k, nouvelle commande sign) au lieu de
+  l'archive entière ; upload vérifie les manifests signés.
+- pull --to-dir / upload --from-dir : transfert par rsync sans archive,
+  additif et idempotent, pour minimiser les fichiers transférés.
+- Correction : échec de signature GPG désormais détecté et bloquant
+  (auparavant silencieusement ignoré) ; message d'erreur propre au lieu
+  d'un crash "variable sans liaison" quand une option attend une valeur.
+
 * Tue Aug 25 2026 Guillaume COURS <15053338+Guillaume001@users.noreply.github.com> - 1.0.0-1
 - Initial RPM packaging for AlmaLinux 9/10.

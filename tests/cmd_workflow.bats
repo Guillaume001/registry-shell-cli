@@ -40,10 +40,103 @@ setup() {
     [ ! -f "${REGISTRY_ROOT}/index.html" ]
 }
 
-@test "upload --require-signature: échoue sans .asc" {
+@test "upload --require-signature: échoue sans manifest signé" {
     run "$REGISTRY_CLI" upload -a alpine.tar.gz -r "$REGISTRY_ROOT" --require-signature
     [ "$status" -ne 0 ]
-    [[ "$output" == *"signature obligatoire"* ]]
+    [[ "$output" == *"manifest signé"* ]]
+}
+
+@test "upload --require-signature --gpg-keyring: vérifie et fusionne les manifests signés" {
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+    "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src-alpine -o signed.tar.gz --no-expand -k "$key_id" >/dev/null
+    local pubkey="${BATS_TEST_TMPDIR}/pubkey.asc"
+    export_test_gpg_pubkey "$key_id" "$pubkey"
+
+    run "$REGISTRY_CLI" upload -a signed.tar.gz -r "$REGISTRY_ROOT" --require-signature --gpg-keyring "$pubkey"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1 manifest(s) signé(s) et vérifié(s)"* ]]
+
+    local mf; mf="$(find "${REGISTRY_ROOT}/v2/alpine" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    [ -f "${mf}.asc" ]
+}
+
+@test "upload --require-signature --gpg-keyring: échoue avant toute fusion si une signature est invalide" {
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+    "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src-alpine -o signed.tar.gz --no-expand -k "$key_id" >/dev/null
+    local pubkey="${BATS_TEST_TMPDIR}/pubkey.asc"
+    export_test_gpg_pubkey "$key_id" "$pubkey"
+
+    # Corrompt le manifest signé DANS l'archive avant upload.
+    local workdir="${BATS_TEST_TMPDIR}/tamper"
+    mkdir -p "$workdir"
+    tar -C "$workdir" -xzf signed.tar.gz
+    local mf; mf="$(find "${workdir}/v2" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    echo "tampered" >> "$mf"
+    tar -C "$workdir" -czf tampered.tar.gz v2 registrish-archive.json
+
+    run "$REGISTRY_CLI" upload -a tampered.tar.gz -r "$REGISTRY_ROOT" --require-signature --gpg-keyring "$pubkey" --skip-checksum
+    [ "$status" -ne 0 ]
+    [ ! -d "${REGISTRY_ROOT}/v2" ]
+}
+
+@test "upload -a et --from-dir sont mutuellement exclusifs" {
+    run "$REGISTRY_CLI" upload -a alpine.tar.gz --from-dir stage -r "$REGISTRY_ROOT"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"mutuellement exclusifs"* ]]
+}
+
+@test "upload: erreur si ni -a ni --from-dir" {
+    run "$REGISTRY_CLI" upload -r "$REGISTRY_ROOT"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"-a/--archive ou --from-dir"* ]]
+}
+
+@test "upload --from-dir: workflow complet pull --to-dir + rsync + upload --from-dir, signé et vérifié" {
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+    "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src-alpine --no-expand --to-dir stage -k "$key_id" >/dev/null
+    local pubkey="${BATS_TEST_TMPDIR}/pubkey.asc"
+    export_test_gpg_pubkey "$key_id" "$pubkey"
+
+    # Simule le transfert rsync vers la machine cible par une simple copie.
+    local incoming="${BATS_TEST_TMPDIR}/incoming"
+    cp -a stage "$incoming"
+
+    run "$REGISTRY_CLI" upload --from-dir "$incoming" -r "$REGISTRY_ROOT" --require-signature --gpg-keyring "$pubkey"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1 manifest(s) signé(s) et vérifié(s)"* ]]
+    [ -f "${REGISTRY_ROOT}/v2/alpine/manifests/3.20" ]
+
+    local mf; mf="$(find "${REGISTRY_ROOT}/v2/alpine" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    [ -f "${mf}.asc" ]
+
+    # Le répertoire source n'est jamais modifié par upload.
+    [ -d "${incoming}/v2/alpine" ]
+}
+
+@test "upload --from-dir: échoue avant toute fusion si un manifest signé est invalide" {
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+    "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src-alpine --no-expand --to-dir stage -k "$key_id" >/dev/null
+    local mf; mf="$(find stage/v2 -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    echo tampered >> "$mf"
+
+    run "$REGISTRY_CLI" upload --from-dir stage -r "$REGISTRY_ROOT"
+    [ "$status" -ne 0 ]
+    [ ! -d "${REGISTRY_ROOT}/v2" ]
+}
+
+@test "upload --from-dir: erreur si le répertoire ou son v2/ est introuvable" {
+    run "$REGISTRY_CLI" upload --from-dir "${BATS_TEST_TMPDIR}/nope" -r "$REGISTRY_ROOT"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"introuvable"* ]]
+
+    mkdir -p empty-dir
+    run "$REGISTRY_CLI" upload --from-dir empty-dir -r "$REGISTRY_ROOT"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"v2/"* ]]
 }
 
 @test "upload: fusionne deux images distinctes sans rien écraser" {

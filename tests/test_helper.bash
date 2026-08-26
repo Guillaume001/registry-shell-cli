@@ -197,3 +197,29 @@ esac
 FAKE_COSIGN_EOF
     chmod +x "${bin_dir}/cosign"
 }
+
+# Génère une paire de clés GPG de test (sans passphrase) dans un GNUPGHOME
+# temporaire dédié et exporte GNUPGHOME pour le reste du test.
+# NE PAS appeler via $(...) : export ne survivrait pas au subshell. Appeler
+# directement, puis lire l'identifiant de la clé dans TEST_GPG_KEY_ID :
+#   setup_test_gpg_key
+#   ... "$TEST_GPG_KEY_ID" ...
+setup_test_gpg_key() {
+    local gnupghome="${BATS_TEST_TMPDIR}/gnupg-test"
+    mkdir -p "$gnupghome"
+    chmod 700 "$gnupghome"
+    export GNUPGHOME="$gnupghome"
+    gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+        --quick-generate-key "registry-cli test <test@example.invalid>" default default never >/dev/null 2>&1
+    TEST_GPG_KEY_ID="$(gpg --batch --list-secret-keys --with-colons \
+        | awk -F: '/^fpr:/ { print $10; exit }')"
+}
+
+# Exporte la clé publique de test (fingerprint donné) dans un fichier, pour
+# simuler un trousseau externe (--gpg-keyring) sans réutiliser le GNUPGHOME
+# de signature.
+#   export_test_gpg_pubkey KEY_ID OUT_FILE
+export_test_gpg_pubkey() {
+    local key_id="$1" out_file="$2"
+    gpg --batch --armor --export "$key_id" > "$out_file"
+}

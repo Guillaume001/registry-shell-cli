@@ -44,7 +44,7 @@ vivant, sur disque (contenant
 et
 .IR index.html ),
 sur lequel
-.BR upload ", " remove ", " gc ", " mirror " et " index
+.BR upload ", " remove ", " gc ", " sign ", " mirror " et " index
 opèrent directement, en place.
 .SH COMMANDES
 .B registry-cli
@@ -128,12 +128,32 @@ est omis, l'archive est nommée
 .BR \-o ", " \-\-output " " \fIARCHIVE\fR
 Chemin de l'archive
 .B .tar.gz
-à produire. Si omis en mode image unique, un nom est généré
-automatiquement :
+à produire. Si omis en mode image unique (et sans
+.BR \-\-to\-dir ),
+un nom est généré automatiquement :
 .IR IMAGE\-LABEL\-ARCH.tar.gz .
+Incompatible avec
+.BR \-\-to\-dir .
+.TP
+.BI \-\-to\-dir " DIR"
+Au lieu d'une archive, fusionne le résultat directement (fichiers en
+clair, additif, idempotent) dans
+.IR DIR/v2 .
+Pensé pour être transféré par
+.B rsync
+avec un delta minimal, puis ingéré avec
+.BR "upload \-\-from\-dir" .
+Incompatible avec
+.BR \-o .
 .TP
 .BR \-k ", " \-\-gpg\-key " " \fIKEY_ID\fR
-Signe l'archive avec cette clé GPG (défaut : pas de signature).
+Signe chaque manifest canonique produit avec cette clé GPG, un fichier
+.I .asc
+détaché par manifest (pas de signature globale de l'archive ; un manifest
+déjà signé n'est jamais re-signé ; défaut : pas de signature). Voir la
+commande
+.B sign
+ci-dessous.
 .TP
 .BI \-\-from\-dir " DIR"
 Utilise un répertoire déjà produit par
@@ -276,20 +296,44 @@ quay.io:
 .B \-r
 .I REGISTRY_ROOT
 .RI [ options ]
+.br
+.B "registry-cli upload \-\-from\-dir"
+.I DIR
+.B \-r
+.I REGISTRY_ROOT
+.RI [ options ]
 .RE
 .PP
-Vérifie l'archive (checksum, et signature GPG si présente), l'extrait, puis
-fusionne ses fichiers
+Vérifie le checksum de la source (mode archive uniquement), l'extrait
+(mode archive), ou la lit directement avec
+.B \-\-from\-dir
+(lecture seule), vérifie la signature GPG de chaque manifest canonique
+signé qu'elle contient (échoue et ne fusionne rien si l'une d'elles est
+invalide), puis fusionne ses fichiers
 .RI ( v2/blobs/... ", " v2/manifests/... )
 avec ceux déjà présents sous
 .IR REGISTRY_ROOT/v2 ,
 sans rien supprimer d'existant.
 .TP
 .BR \-a ", " \-\-archive " " \fIARCHIVE\fR
-Obligatoire. Archive
+Archive
 .B .tar.gz
 produite par
 .BR pull .
+Incompatible avec
+.BR \-\-from\-dir ;
+l'une des deux est obligatoire.
+.TP
+.BI \-\-from\-dir " DIR"
+Répertoire déjà produit par
+.B "pull \-\-to\-dir"
+(ou
+.BR mirror ),
+transféré ici tel quel (ex :
+.BR rsync ).
+Contient déjà
+.I v2/...
+directement, sans archive.
 .TP
 .BR \-r ", " \-\-registry\-root " " \fIDIR\fR
 Obligatoire. Racine filesystem de la registry.
@@ -300,8 +344,8 @@ Régénère
 après la fusion. Activé par défaut.
 .TP
 .B \-\-require\-signature
-Échoue si l'archive n'a pas de signature
-.IR .asc .
+Échoue si l'archive ne contient aucun manifest signé
+.RI ( .asc ).
 .TP
 .B \-\-skip\-checksum
 Ne vérifie pas le fichier
@@ -310,7 +354,7 @@ associé.
 .TP
 .BI \-\-gpg\-keyring " FICHIER"
 Fichier de clés publiques importé dans un trousseau temporaire pour la
-vérification de signature.
+vérification des manifests signés.
 .SS "list \- inventaire d'une registry"
 .RS
 .B registry-cli list \-r
@@ -418,6 +462,67 @@ Simule le nettoyage sans rien supprimer.
 Régénère
 .I v2/.htaccess
 après nettoyage. Activé par défaut.
+.SS "sign \- signer/vérifier les manifests d'une registry avec GPG"
+.RS
+.B registry-cli sign \-r
+.I REGISTRY_ROOT
+.RB ( \-k
+.I KEY_ID
+.RB "| " \-\-check ")"
+.RI [ options ]
+.RE
+.PP
+Signe (ou vérifie) individuellement, avec GPG, chaque manifest
+.B canonique
+d'une registry déjà en place. Ne touche jamais aux blobs, aux copies par
+tag, ni aux artefacts cosign compagnons : seuls les manifests eux-mêmes
+sont signés, ce qui limite ce qui doit être re-transféré (
+.BR rsync )
+lors d'une re-signature ou d'un ajout ultérieur de contenu. Utile pour
+signer du contenu ajouté par
+.B mirror
+(qui n'appelle pas GPG lui-même), après une rotation de clé, ou pour un
+contrôle d'intégrité périodique.
+.TP
+.BR \-r ", " \-\-registry\-root " " \fIDIR\fR
+Obligatoire.
+.TP
+.BR \-k ", " \-\-gpg\-key " " \fIKEY_ID\fR
+Signe chaque manifest canonique non encore signé avec cette clé GPG.
+.TP
+.B \-\-check
+Ne signe rien : vérifie les fichiers
+.I .asc
+déjà présents (échoue net si l'un d'eux est invalide). Incompatible avec
+.BR \-k .
+.TP
+.BR \-i ", " \-\-image " " \fIIMAGE\fR
+Limite l'opération à cette image (chemin sous
+.IR v2/ ,
+ex :
+.IR library/alpine ).
+Répétable. Par défaut : toute la registry.
+.TP
+.BI \-\-gpg\-keyring " FICHIER"
+Fichier de clés publiques importé dans un trousseau temporaire pour
+.BR \-\-check ,
+au lieu du trousseau GPG par défaut de l'utilisateur.
+.TP
+.B \-\-force
+Re-signe même les manifests déjà signés (ex : après rotation de clé). Sans
+effet avec
+.BR \-\-check .
+.TP
+.B \-\-dry\-run
+Affiche ce qui serait signé/vérifié sans rien écrire.
+.TP
+.BR \-y ", " \-\-yes
+Ne demande pas de confirmation.
+.TP
+.BR \-\-regen\-config " / " \-\-no\-regen\-config
+Régénère
+.I v2/.htaccess
+après signature. Activé par défaut.
 .SS "index \- (re)générer le tableau de bord HTML de la registry"
 .RS
 .B registry-cli index \-r

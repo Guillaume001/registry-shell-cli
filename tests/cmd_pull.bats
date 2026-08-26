@@ -55,6 +55,15 @@ setup() {
     [[ "$output" == *"-i/--image est obligatoire"* ]]
 }
 
+@test "pull -c --gpg-key sans valeur (dernier argument) : erreur propre, pas de crash 'variable sans liaison'" {
+    printf 'docker.io: {}\n' > sync.yaml
+    run "$REGISTRY_CLI" pull -c sync.yaml --with-signatures --to-dir stage --gpg-key
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--gpg-key nécessite une valeur"* ]]
+    [[ "$output" != *"sans liaison"* ]]
+    [[ "$output" != *"unbound variable"* ]]
+}
+
 @test "pull: sans -t ni -d ni --from-dir est une erreur" {
     run "$REGISTRY_CLI" pull -i alpine
     [ "$status" -ne 0 ]
@@ -92,6 +101,79 @@ setup() {
     run cmd_pull -i alpine -t 3.20 --from-dir skopeo-src -o out.tar.gz -k somekey
     [ "$status" -ne 0 ]
     [[ "$output" == *"gpg"* ]]
+}
+
+@test "pull -k: un échec réel de signature GPG (clé invalide) fait échouer la commande, pas un succès silencieux" {
+    build_skopeo_dir "skopeo-src" > /dev/null
+    run "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src --no-expand --to-dir stage -k "0xDOESNOTEXIST"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"échec de la signature GPG"* ]]
+    [[ "$output" != *"==> Terminé."* ]]
+    ! find stage -name '*.asc' | grep -q .
+}
+
+@test "pull -k: signe chaque manifest canonique de l'archive, pas les blobs, pas l'archive elle-même" {
+    build_skopeo_dir "skopeo-src" > /dev/null
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+
+    run "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src -o out.tar.gz --no-expand -k "$key_id"
+    [ "$status" -eq 0 ]
+    [ ! -f "out.tar.gz.asc" ]
+
+    tar -xzf out.tar.gz
+    local mf; mf="$(find v2 -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    [ -n "$mf" ]
+    [ -f "${mf}.asc" ]
+    run gpg --batch --verify "${mf}.asc" "$mf"
+    [ "$status" -eq 0 ]
+
+    [ ! -f "v2/alpine/manifests/3.20.asc" ]
+    local blob
+    for blob in v2/alpine/blobs/sha256:*; do
+        [ ! -f "${blob}.asc" ]
+    done
+}
+
+@test "pull -o et --to-dir sont mutuellement exclusifs" {
+    run "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src -o out.tar.gz --to-dir stage
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"mutuellement exclusifs"* ]]
+}
+
+@test "pull --to-dir: fusionne v2/ en clair (pas d'archive), de façon additive" {
+    build_skopeo_dir "skopeo-src" > /dev/null
+    run "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src --no-expand --to-dir stage
+    [ "$status" -eq 0 ]
+    [ -f "stage/v2/alpine/manifests/3.20" ]
+    [ ! -f "out.tar.gz" ]
+    # Pas de registry servable : pas de .htaccess/index.html générés dans stage/.
+    [ ! -f "stage/v2/.htaccess" ]
+    [ ! -f "stage/index.html" ]
+
+    # Une deuxième image se fusionne additivement, sans toucher à la première.
+    build_skopeo_dir "skopeo-src-nginx" > /dev/null
+    run "$REGISTRY_CLI" pull -i nginx -t 1.25 --from-dir skopeo-src-nginx --no-expand --to-dir stage
+    [ "$status" -eq 0 ]
+    [ -f "stage/v2/alpine/manifests/3.20" ]
+    [ -f "stage/v2/nginx/manifests/1.25" ]
+}
+
+@test "pull --to-dir -k: signe une seule fois -- une deuxième pull identique laisse le .asc inchangé" {
+    build_skopeo_dir "skopeo-src" > /dev/null
+    setup_test_gpg_key
+    local key_id="$TEST_GPG_KEY_ID"
+
+    "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src --no-expand --to-dir stage -k "$key_id" >/dev/null
+    local mf; mf="$(find stage/v2 -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')"
+    local before; before="$(cat "${mf}.asc")"
+
+    run "$REGISTRY_CLI" pull -i alpine -t 3.20 --from-dir skopeo-src --no-expand --to-dir stage -k "$key_id"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 nouveau(x) manifest(s) signé(s)"* ]]
+
+    local after; after="$(cat "${mf}.asc")"
+    [ "$before" = "$after" ]
 }
 
 # --- pull -c/--config (mode multi-images/tags via skopeo sync) -------------
@@ -177,6 +259,35 @@ setup() {
     [ "$status" -eq 0 ]
     [ -f "${BATS_TEST_TMPDIR}/root/v2/docker.io/library/alpine/manifests/3.20" ]
     [ -f "${BATS_TEST_TMPDIR}/root/v2/docker.io/library/alpine/manifests/latest" ]
+}
+
+@test "pull -c --to-dir: fusionne tous les tags synchronisés directement dans DIR/v2, signés, sans archive" {
+    local fakebin="${BATS_TEST_TMPDIR}/fakebin"
+    install_fake_skopeo "$fakebin"
+
+    local sync_out="${BATS_TEST_TMPDIR}/sync-out"
+    build_sync_dir_entry "$sync_out" "docker.io/library/alpine" "3.20" > /dev/null
+    build_sync_dir_entry "$sync_out" "quay.io/coreos/etcd" "latest" > /dev/null
+    printf 'docker.io:\n  images:\n    library/alpine:\n      - "3.20"\nquay.io:\n  images:\n    coreos/etcd:\n      - latest\n' > sync.yaml
+
+    local map="${BATS_TEST_TMPDIR}/skopeo-map.tsv"
+    printf 'sync.yaml\t%s\n' "$sync_out" > "$map"
+
+    setup_test_gpg_key
+
+    PATH="${fakebin}:${PATH}" FAKE_SKOPEO_MAP="$map" \
+        run "$REGISTRY_CLI" pull -c sync.yaml --to-dir stage -k "$TEST_GPG_KEY_ID"
+
+    [ "$status" -eq 0 ]
+    [ ! -f "sync-mirror.tar.gz" ]
+    [[ "$output" == *"2 tag(s) synchronisé(s) dans stage/v2"* ]]
+    [ -f "stage/v2/docker.io/library/alpine/manifests/3.20" ]
+    [ -f "stage/v2/quay.io/coreos/etcd/manifests/latest" ]
+
+    local mf
+    while IFS= read -r mf; do
+        [ -f "${mf}.asc" ]
+    done < <(find stage/v2 -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$')
 }
 
 @test "pull -c: erreur si aucun tag n'est synchronisé (config vide/sans correspondance)" {

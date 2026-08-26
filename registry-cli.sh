@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-REGISTRY_CLI_VERSION="1.0.0"
+REGISTRY_CLI_VERSION="1.1.0"
 
 usage() {
     cat <<EOF
@@ -47,6 +47,7 @@ Commandes :
   list        Liste les images et tags disponibles dans une registry
   remove      Supprime un tag ou une image entière d'une registry
   gc          Nettoie les manifests/blobs orphelins de TOUTE la registry
+  sign        Signe (ou vérifie) les manifests d'une registry avec GPG
   index       (Re)génère la page index.html à la racine de la registry
   verify      Vérifie la signature cosign d'une image (clé publique)
   sbom        Extrait un SBOM CycloneDX attesté (cosign) au format JSON
@@ -310,7 +311,7 @@ list_manifest_entries() {
         [[ -n "${tagged_digests[$d]:-}" ]] && continue
         [[ -n "${hidden_digests[$d]:-}" ]] && continue
         printf '%s\t%s\n' "$NO_TAG_MARKER" "$f"
-    done < <(find "$manifest_dir" -maxdepth 1 -type f -name 'sha256:*' 2>/dev/null | sort)
+    done < <(find "$manifest_dir" -maxdepth 1 -type f -name 'sha256:*' ! -name '*.asc' 2>/dev/null | sort)
 }
 
 # ===========================================================================
@@ -369,6 +370,36 @@ convert_skopeo_dir_to_v2() {
         esac
     done
     return 0
+}
+
+# Signe (détaché, armored) chaque manifest CANONIQUE (nom = son propre
+# digest, "manifests/sha256:<hex>", sans suffixe) sous v2_root avec la clé
+# GPG donnée. Ne touche jamais aux blobs, aux copies par tag, ni aux
+# artefacts cosign compagnons (format "sha256-<hex>.sig/.att/.sbom").
+# Args : v2_root  gpg_key  force(true/false)
+# Affiche sur stdout, une ligne par manifest signé (son chemin complet).
+# Tente TOUS les manifests même si l'un d'eux échoue (erreur détaillée sur
+# stderr pour chacun) ; retourne 1 si au moins un échec a eu lieu -- le
+# caller DOIT capturer la sortie via "$(...)" (pas "< <(...)") pour que ce
+# code de retour soit visible, une substitution de processus l'ignorant
+# silencieusement.
+sign_manifests_gpg() {
+    local v2_root="$1" gpg_key="$2" force="$3"
+    local mf asc failed="false"
+    while IFS= read -r mf; do
+        asc="${mf}.asc"
+        if [[ "$force" == "false" && -f "$asc" ]]; then
+            continue
+        fi
+        if gpg --batch --yes --local-user "$gpg_key" \
+            --armor --detach-sign --output "$asc" "$mf"; then
+            echo "$mf"
+        else
+            echo "Erreur : échec de la signature GPG de ${mf}." >&2
+            failed="true"
+        fi
+    done < <(find "$v2_root" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$' | sort)
+    [[ "$failed" == "false" ]]
 }
 
 # ===========================================================================
@@ -611,8 +642,14 @@ regen_apache2_config() {
                 [[ -f "$f" ]] || continue
                 base="$(basename "$f")"
                 [[ "$base" == ".htaccess" ]] && continue
-                content_type="$(read_media_type "$f")"
-                [[ "$content_type" == "null" ]] && content_type="$(guess_media_type_for_missing_field "$f")"
+                if [[ "$base" == *.asc ]]; then
+                    # Signature GPG détachée d'un manifest (pas du JSON) : ne pas
+                    # tenter de deviner un mediaType dessus.
+                    content_type="application/pgp-signature"
+                else
+                    content_type="$(read_media_type "$f")"
+                    [[ "$content_type" == "null" ]] && content_type="$(guess_media_type_for_missing_field "$f")"
+                fi
                 printf '<Files %s>\n  ForceType %s\n</Files>\n' "$base" "$content_type"
             done
             for f in "$manifest_dir"/*; do
@@ -1296,9 +1333,9 @@ HTML_PART2_EOF
 # ===========================================================================
 usage_pull() {
     cat <<EOF
-Usage: ${SCRIPT_NAME} pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz] [options]
-   ou: ${SCRIPT_NAME} pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz] --from-dir DIR
-   ou: ${SCRIPT_NAME} pull -c CONFIG.yaml [-o ARCHIVE.tar.gz] [options]
+Usage: ${SCRIPT_NAME} pull -i IMAGE (-t TAG | -d DIGEST) [-o ARCHIVE.tar.gz | --to-dir DIR] [options]
+   ou: ${SCRIPT_NAME} pull -i IMAGE [-t TAG] [-d DIGEST] [-o ARCHIVE.tar.gz | --to-dir DIR] --from-dir DIR
+   ou: ${SCRIPT_NAME} pull -c CONFIG.yaml [-o ARCHIVE.tar.gz | --to-dir DIR] [options]
 
 Options obligatoires (un seul des deux modes) :
   -i, --image IMAGE          Mode image unique. Nom de l'image (ex: alpine,
@@ -1330,7 +1367,22 @@ Options :
                                (LABEL = le tag, ou les 12 premiers caractères du
                                digest si pas de tag), ex : alpine-3.20-amd64.tar.gz
                                ou alpine-a1b2c3d4e5f6-amd64.tar.gz
-  -k, --gpg-key KEY_ID       Clé GPG pour signer l'archive (défaut : pas de signature)
+                               Incompatible avec --to-dir.
+      --to-dir DIR            Au lieu d'une archive, fusionne le résultat directement
+                               (fichiers en clair, sans tar/gzip) dans DIR/v2, de façon
+                               additive et idempotente -- appels répétés (cron) ne
+                               réécrivent que le contenu nouveau/modifié. Pensé pour
+                               être ensuite transféré par 'rsync -a DIR/ machine-b:DIR/'
+                               (bien moins de données transférées qu'une archive tar.gz,
+                               qui change intégralement à chaque régénération) puis
+                               ingéré avec 'upload --from-dir DIR' côté machine cible.
+                               DIR n'est PAS une registry servable telle quelle (pas de
+                               .htaccess/index.html générés) : voir la section
+                               "Transfert par rsync (pull --to-dir / upload --from-dir)"
+                               du README. Incompatible avec -o/--output.
+  -k, --gpg-key KEY_ID       Clé GPG pour signer chaque manifest canonique produit
+                               (un .asc détaché par manifest, jamais signé deux fois
+                               pour un même contenu -- défaut : pas de signature)
       --from-dir DIR         Utilise un répertoire déjà produit par
                                'skopeo copy ... dir:DIR' au lieu d'appeler skopeo
                                (permet un usage 100% offline : téléchargez avec
@@ -1395,33 +1447,39 @@ EOF
 }
 
 cmd_pull() {
-    local image="" tag="" digest="" output="" gpg_key="" from_dir="" config=""
+    local image="" tag="" digest="" output="" to_dir="" gpg_key="" from_dir="" config=""
     local source_prefix="docker://" arch="amd64" os="linux" keep_workdir="false" no_expand="false"
     local with_signatures="false" sig_from_dir="" att_from_dir="" sbom_from_dir="" keep_going="false"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -i|--image) image="$2"; shift 2 ;;
-            -t|--tag) tag="$2"; shift 2 ;;
-            -d|--digest) digest="$2"; shift 2 ;;
-            -o|--output) output="$2"; shift 2 ;;
-            -k|--gpg-key) gpg_key="$2"; shift 2 ;;
-            -c|--config) config="$2"; shift 2 ;;
-            --from-dir) from_dir="$2"; shift 2 ;;
-            --source) source_prefix="$2"; shift 2 ;;
-            --arch) arch="$2"; shift 2 ;;
-            --os) os="$2"; shift 2 ;;
+            -i|--image) image="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -t|--tag) tag="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -d|--digest) digest="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -o|--output) output="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --to-dir) to_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -k|--gpg-key) gpg_key="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -c|--config) config="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --from-dir) from_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --source) source_prefix="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --arch) arch="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --os) os="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --no-expand) no_expand="true"; shift ;;
             --keep-workdir) keep_workdir="true"; shift ;;
             --keep-going) keep_going="true"; shift ;;
             --with-signatures) with_signatures="true"; shift ;;
-            --sig-from-dir) sig_from_dir="$2"; shift 2 ;;
-            --att-from-dir) att_from_dir="$2"; shift 2 ;;
-            --sbom-from-dir) sbom_from_dir="$2"; shift 2 ;;
+            --sig-from-dir) sig_from_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --att-from-dir) att_from_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --sbom-from-dir) sbom_from_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             -h|--help) usage_pull; exit 0 ;;
             *) echo "Option inconnue pour 'pull' : $1" >&2; exit 1 ;;
         esac
     done
+
+    if [[ -n "$output" && -n "$to_dir" ]]; then
+        echo "Erreur : -o/--output et --to-dir sont mutuellement exclusifs." >&2
+        exit 1
+    fi
 
     if [[ -n "$config" ]]; then
         if [[ -n "$image" || -n "$tag" || -n "$digest" || -n "$from_dir" ]]; then
@@ -1431,14 +1489,15 @@ cmd_pull() {
         fi
         [[ -f "$config" ]] || { echo "Erreur : fichier de config introuvable : $config" >&2; exit 1; }
         command -v skopeo >/dev/null 2>&1 || { echo "Erreur : 'skopeo' est requis pour -c/--config." >&2; exit 1; }
-        for bin in tar sha256sum; do
-            command -v "$bin" >/dev/null 2>&1 || { echo "Erreur : '$bin' est requis mais introuvable." >&2; exit 1; }
-        done
+        command -v sha256sum >/dev/null 2>&1 || { echo "Erreur : 'sha256sum' est requis mais introuvable." >&2; exit 1; }
+        if [[ -z "$to_dir" ]]; then
+            command -v tar >/dev/null 2>&1 || { echo "Erreur : 'tar' est requis mais introuvable." >&2; exit 1; }
+        fi
         if [[ -n "$gpg_key" ]]; then
             command -v gpg >/dev/null 2>&1 || { echo "Erreur : 'gpg' est requis pour signer mais introuvable." >&2; exit 1; }
         fi
 
-        if [[ -z "$output" ]]; then
+        if [[ -z "$output" && -z "$to_dir" ]]; then
             local sanitized_config
             sanitized_config="$(basename "$config" | tr '/: ' '---')"
             output="${sanitized_config%.*}-mirror.tar.gz"
@@ -1453,15 +1512,51 @@ cmd_pull() {
             trap 'rm -rf "'"$workdir"'"' EXIT
         fi
 
-        local v2_root="${workdir}/v2"
+        local v2_root
+        if [[ -n "$to_dir" ]]; then
+            v2_root="${to_dir}/v2"
+            mkdir -p "$v2_root"
+        else
+            v2_root="${workdir}/v2"
+        fi
         local sync_output=""
         sync_output="$(sync_yaml_into_v2 "$config" "$v2_root" "$workdir" "$with_signatures" "$keep_going" "false")"
 
         local n_tags=0
         [[ -n "$sync_output" ]] && n_tags="$(printf '%s\n' "$sync_output" | grep -c .)"
         if [[ "$n_tags" -eq 0 ]]; then
-            echo "Erreur : aucun tag synchronisé depuis ${config} -- archive non produite." >&2
+            echo "Erreur : aucun tag synchronisé depuis ${config} -- rien produit." >&2
             exit 1
+        fi
+
+        local n_signed=0
+        if [[ -n "$gpg_key" ]]; then
+            echo "==> Signature GPG des manifests avec la clé ${gpg_key}..."
+            local sign_output sign_status=0
+            sign_output="$(sign_manifests_gpg "$v2_root" "$gpg_key" "false")" || sign_status=$?
+            if [[ -n "$sign_output" ]]; then
+                local signed_mf
+                while IFS= read -r signed_mf; do
+                    echo "    signé : ${signed_mf#"$v2_root"/}"
+                    n_signed=$((n_signed + 1))
+                done <<< "$sign_output"
+            fi
+            echo "    ${n_signed} nouveau(x) manifest(s) signé(s) (déjà signés ignorés)."
+            if [[ "$sign_status" -ne 0 ]]; then
+                echo "Erreur : échec de la signature GPG d'au moins un manifest -- abandon." >&2
+                exit 1
+            fi
+        else
+            echo "==> Aucune clé GPG fournie : manifests non signés."
+        fi
+
+        if [[ -n "$to_dir" ]]; then
+            echo "==> Terminé."
+            echo "    ${n_tags} tag(s) synchronisé(s) dans ${to_dir}/v2 (fusion additive)."
+            if [[ -n "$gpg_key" ]]; then
+                echo "    Nouveaux manifests signés : ${n_signed}"
+            fi
+            return 0
         fi
 
         local created_at
@@ -1487,21 +1582,12 @@ cmd_pull() {
         sha256sum "$output" > "${output}.sha256"
         echo "    $(cat "${output}.sha256")"
 
-        if [[ -n "$gpg_key" ]]; then
-            echo "==> Signature GPG avec la clé ${gpg_key}..."
-            gpg --batch --yes --local-user "$gpg_key" \
-                --armor --detach-sign --output "${output}.asc" "$output"
-            echo "    Signature écrite dans ${output}.asc"
-        else
-            echo "==> Aucune clé GPG fournie : archive non signée."
-        fi
-
         echo "==> Terminé."
         echo "    ${n_tags} tag(s) inclus dans l'archive."
         echo "    Archive : ${output}"
         echo "    SHA256  : ${output}.sha256"
         if [[ -n "$gpg_key" ]]; then
-            echo "    Signature : ${output}.asc"
+            echo "    Manifests signés : ${n_signed}"
         fi
         return 0
     fi
@@ -1528,7 +1614,7 @@ cmd_pull() {
         exit 1
     fi
 
-    if [[ -z "$output" ]]; then
+    if [[ -z "$output" && -z "$to_dir" ]]; then
         local sanitized_image name_label arch_for_filename
         sanitized_image="$(printf '%s' "$image" | tr '/: ' '---')"
         if [[ -n "$tag" ]]; then
@@ -1550,9 +1636,10 @@ cmd_pull() {
         echo "==> Nom de fichier généré automatiquement : ${output}"
     fi
 
-    for bin in tar sha256sum; do
-        command -v "$bin" >/dev/null 2>&1 || { echo "Erreur : '$bin' est requis mais introuvable." >&2; exit 1; }
-    done
+    command -v sha256sum >/dev/null 2>&1 || { echo "Erreur : 'sha256sum' est requis mais introuvable." >&2; exit 1; }
+    if [[ -z "$to_dir" ]]; then
+        command -v tar >/dev/null 2>&1 || { echo "Erreur : 'tar' est requis mais introuvable." >&2; exit 1; }
+    fi
     if [[ -n "$gpg_key" ]]; then
         command -v gpg >/dev/null 2>&1 || { echo "Erreur : 'gpg' est requis pour signer mais introuvable." >&2; exit 1; }
     fi
@@ -1594,7 +1681,12 @@ cmd_pull() {
     fi
 
     echo "==> Conversion en arborescence de registry statique..."
-    local v2_root="${workdir}/v2"
+    local v2_root
+    if [[ -n "$to_dir" ]]; then
+        v2_root="${to_dir}/v2"
+    else
+        v2_root="${workdir}/v2"
+    fi
     mkdir -p "$v2_root"
     convert_skopeo_dir_to_v2 "$skopeo_dest" "$image" "$tag" "$v2_root" || exit 1
 
@@ -1659,6 +1751,36 @@ cmd_pull() {
         fi
     fi
 
+    local n_signed=0
+    if [[ -n "$gpg_key" ]]; then
+        echo "==> Signature GPG des manifests avec la clé ${gpg_key}..."
+        local sign_output sign_status=0
+        sign_output="$(sign_manifests_gpg "$v2_root" "$gpg_key" "false")" || sign_status=$?
+        if [[ -n "$sign_output" ]]; then
+            local signed_mf
+            while IFS= read -r signed_mf; do
+                echo "    signé : ${signed_mf#"$v2_root"/}"
+                n_signed=$((n_signed + 1))
+            done <<< "$sign_output"
+        fi
+        echo "    ${n_signed} nouveau(x) manifest(s) signé(s) (déjà signés ignorés)."
+        if [[ "$sign_status" -ne 0 ]]; then
+            echo "Erreur : échec de la signature GPG d'au moins un manifest -- abandon." >&2
+            exit 1
+        fi
+    else
+        echo "==> Aucune clé GPG fournie : manifests non signés."
+    fi
+
+    if [[ -n "$to_dir" ]]; then
+        echo "==> Terminé."
+        echo "    Image fusionnée dans ${to_dir}/v2."
+        if [[ -n "$gpg_key" ]]; then
+            echo "    Nouveaux manifests signés : ${n_signed}"
+        fi
+        return 0
+    fi
+
     local created_at arch_label
     created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [[ -n "$from_dir" ]]; then
@@ -1686,20 +1808,11 @@ EOF
     sha256sum "$output" > "${output}.sha256"
     echo "    $(cat "${output}.sha256")"
 
-    if [[ -n "$gpg_key" ]]; then
-        echo "==> Signature GPG avec la clé ${gpg_key}..."
-        gpg --batch --yes --local-user "$gpg_key" \
-            --armor --detach-sign --output "${output}.asc" "$output"
-        echo "    Signature écrite dans ${output}.asc"
-    else
-        echo "==> Aucune clé GPG fournie : archive non signée."
-    fi
-
     echo "==> Terminé."
     echo "    Archive : ${output}"
     echo "    SHA256  : ${output}.sha256"
     if [[ -n "$gpg_key" ]]; then
-        echo "    Signature : ${output}.asc"
+        echo "    Manifests signés : ${n_signed}"
     fi
 }
 
@@ -1762,8 +1875,8 @@ cmd_mirror() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -c|--config) config="$2"; shift 2 ;;
-            -r|--registry-root) root="$2"; shift 2 ;;
+            -c|--config) config="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --with-signatures) with_signatures="true"; shift ;;
             --keep-going) keep_going="true"; shift ;;
             --dry-run) dry_run="true"; shift ;;
@@ -1820,72 +1933,119 @@ cmd_mirror() {
 usage_upload() {
     cat <<EOF
 Usage: ${SCRIPT_NAME} upload -a ARCHIVE -r REGISTRY_ROOT [options]
+   ou: ${SCRIPT_NAME} upload --from-dir DIR -r REGISTRY_ROOT [options]
+
+Une des deux sources est obligatoire (mutuellement exclusives) :
+  -a, --archive ARCHIVE      Archive .tar.gz produite par 'pull'
+      --from-dir DIR         Répertoire déjà produit par 'pull --to-dir DIR' (ou
+                               'mirror'), puis transféré tel quel ici (ex: rsync).
+                               Contient déjà v2/... directement, sans archive :
+                               voir "Transfert par rsync" dans le README pour le
+                               workflow complet pull --to-dir + rsync + upload
+                               --from-dir.
 
 Options obligatoires :
-  -a, --archive ARCHIVE      Archive .tar.gz produite par 'pull'
   -r, --registry-root DIR    Racine filesystem de la registry
 
 Options :
       --regen-config          Régénère v2/.htaccess (Apache2) après l'ajout des fichiers
                                (défaut : activé — utilisez --no-regen-config pour désactiver)
       --no-regen-config       Désactive la régénération de v2/.htaccess
-      --require-signature     Échoue si l'archive n'a pas de signature .asc
-      --skip-checksum         Ne vérifie pas le fichier .sha256 associé
+      --require-signature     Échoue si aucun manifest signé (.asc) n'est présent
+                               dans la source (archive ou répertoire)
+      --skip-checksum         Ne vérifie pas le fichier .sha256 associé (mode -a
+                               uniquement ; sans effet avec --from-dir)
       --gpg-keyring FICHIER   Fichier de clés publiques à importer dans un trousseau
-                               temporaire pour la vérification de signature
+                               temporaire pour la vérification des signatures
 
-L'archive est vérifiée (checksum + signature GPG si présente), extraite, puis
-ses fichiers (v2/blobs/..., v2/manifests/...) sont fusionnés avec ceux déjà
-présents dans REGISTRY_ROOT/v2, sans rien supprimer d'existant.
+Avec -a : l'archive est vérifiée (checksum), extraite, puis chaque manifest
+canonique signé (v2/.../manifests/sha256:<hex>.asc) est vérifié avec GPG.
+Avec --from-dir : le répertoire (déjà en clair) est utilisé directement, même
+vérification des manifests signés qu'il contient. Dans les deux cas, l'upload
+est abandonné (rien n'est fusionné) si une signature présente est invalide.
+Les fichiers (v2/blobs/..., v2/manifests/...) sont ensuite fusionnés avec ceux
+déjà présents dans REGISTRY_ROOT/v2, sans rien supprimer d'existant.
 
-Exemple :
+Exemples :
   ${SCRIPT_NAME} upload -a alpine-3.20.tar.gz -r /srv/registrish
+  ${SCRIPT_NAME} upload --from-dir /var/lib/registry-incoming -r /srv/registrish
 EOF
 }
 
 cmd_upload() {
-    local archive="" root="" regen_config="true"
+    local archive="" from_dir="" root="" regen_config="true"
     local require_signature="false" skip_checksum="false" gpg_keyring=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -a|--archive) archive="$2"; shift 2 ;;
-            -r|--registry-root) root="$2"; shift 2 ;;
+            -a|--archive) archive="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --from-dir) from_dir="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --regen-config) regen_config="true"; shift ;;
             --no-regen-config) regen_config="false"; shift ;;
             --require-signature) require_signature="true"; shift ;;
             --skip-checksum) skip_checksum="true"; shift ;;
-            --gpg-keyring) gpg_keyring="$2"; shift 2 ;;
+            --gpg-keyring) gpg_keyring="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             -h|--help) usage_upload; exit 0 ;;
             *) echo "Option inconnue pour 'upload' : $1" >&2; exit 1 ;;
         esac
     done
 
-    [[ -n "$archive" ]] || { echo "Erreur : -a/--archive est obligatoire." >&2; exit 1; }
-    [[ -f "$archive" ]] || { echo "Erreur : archive introuvable : $archive" >&2; exit 1; }
+    if [[ -n "$archive" && -n "$from_dir" ]]; then
+        echo "Erreur : -a/--archive et --from-dir sont mutuellement exclusifs." >&2
+        exit 1
+    fi
+    if [[ -z "$archive" && -z "$from_dir" ]]; then
+        echo "Erreur : précisez -a/--archive ou --from-dir." >&2
+        exit 1
+    fi
     [[ -n "$root" ]] || { echo "Erreur : -r/--registry-root est obligatoire." >&2; exit 1; }
 
-    for bin in tar sha256sum; do
-        command -v "$bin" >/dev/null 2>&1 || { echo "Erreur : '$bin' est requis mais introuvable." >&2; exit 1; }
-    done
+    command -v sha256sum >/dev/null 2>&1 || { echo "Erreur : 'sha256sum' est requis mais introuvable." >&2; exit 1; }
 
-    # --- 1. Vérification du checksum ---
-    if [[ "$skip_checksum" == "false" && -f "${archive}.sha256" ]]; then
-        echo "==> Vérification du SHA256 de l'archive..."
-        local archive_dir; archive_dir="$(dirname "$archive")"
-        (cd "$archive_dir" && sha256sum -c "$(basename "${archive}.sha256")") \
-            || { echo "Erreur : le SHA256 ne correspond pas. Abandon." >&2; exit 1; }
-        echo "    OK."
+    local src_v2 workdir=""
+    if [[ -n "$from_dir" ]]; then
+        [[ -d "$from_dir" ]] || { echo "Erreur : --from-dir introuvable : $from_dir" >&2; exit 1; }
+        [[ -d "${from_dir}/v2" ]] || { echo "Erreur : ${from_dir} ne contient pas de répertoire v2/." >&2; exit 1; }
+        src_v2="${from_dir}/v2"
+    else
+        [[ -f "$archive" ]] || { echo "Erreur : archive introuvable : $archive" >&2; exit 1; }
+        command -v tar >/dev/null 2>&1 || { echo "Erreur : 'tar' est requis mais introuvable." >&2; exit 1; }
+
+        # --- 1. Vérification du checksum ---
+        if [[ "$skip_checksum" == "false" && -f "${archive}.sha256" ]]; then
+            echo "==> Vérification du SHA256 de l'archive..."
+            local archive_dir; archive_dir="$(dirname "$archive")"
+            (cd "$archive_dir" && sha256sum -c "$(basename "${archive}.sha256")") \
+                || { echo "Erreur : le SHA256 ne correspond pas. Abandon." >&2; exit 1; }
+            echo "    OK."
+        fi
+
+        # --- 2. Extraction ---
+        workdir="$(mktemp -d "/tmp/registry-cli-upload.XXXXXX")"
+        trap 'rm -rf "'"$workdir"'"' EXIT
+        echo "==> Extraction de l'archive..."
+        tar -C "$workdir" -xzf "$archive"
+        [[ -d "${workdir}/v2" ]] || { echo "Erreur : l'archive ne contient pas de répertoire v2/." >&2; exit 1; }
+
+        if [[ -f "${workdir}/registrish-archive.json" ]]; then
+            echo "==> Métadonnées de l'archive :"
+            cat "${workdir}/registrish-archive.json"
+        fi
+        src_v2="${workdir}/v2"
     fi
 
-    # --- 2. Vérification de la signature GPG (si présente) ---
-    local sig_file="${archive}.asc"
-    if [[ -f "$sig_file" ]]; then
-        command -v gpg >/dev/null 2>&1 || { echo "Erreur : signature présente mais 'gpg' introuvable." >&2; exit 1; }
-        echo "==> Vérification de la signature GPG (${sig_file})..."
+    # --- 3. Vérification des signatures GPG par manifest (si présentes) ---
+    local -a manifests_all=()
+    while IFS= read -r mf; do manifests_all+=("$mf"); done \
+        < <(find "$src_v2" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$' | sort)
 
+    local n_signed=0 n_unsigned=0
+    if [[ "${#manifests_all[@]}" -gt 0 ]]; then
+        echo "==> Vérification des signatures GPG des manifests..."
         local gnupghome_tmp=""
         if [[ -n "$gpg_keyring" ]]; then
+            command -v gpg >/dev/null 2>&1 || { echo "Erreur : --gpg-keyring fourni mais 'gpg' introuvable." >&2; exit 1; }
             gnupghome_tmp="$(mktemp -d "/tmp/registry-cli-gnupg.XXXXXX")"
             chmod 700 "$gnupghome_tmp"
             export GNUPGHOME="$gnupghome_tmp"
@@ -1893,45 +2053,40 @@ cmd_upload() {
             trap '[[ -n "'"$gnupghome_tmp"'" ]] && rm -rf "'"$gnupghome_tmp"'"' RETURN
         fi
 
-        local gpg_log; gpg_log="$(mktemp "/tmp/registry-cli-gpg-verify.XXXXXX")"
-        if gpg --batch --verify "$sig_file" "$archive" 2>&1 | tee "$gpg_log"; then
-            grep -q "Good signature" "$gpg_log" || { echo "Erreur : signature non confirmée valide." >&2; rm -f "$gpg_log"; exit 1; }
-            echo "    Signature valide."
-        else
-            echo "Erreur : signature GPG invalide. Abandon." >&2
+        local mf asc gpg_log
+        for mf in "${manifests_all[@]}"; do
+            asc="${mf}.asc"
+            if [[ ! -f "$asc" ]]; then
+                n_unsigned=$((n_unsigned + 1))
+                continue
+            fi
+            command -v gpg >/dev/null 2>&1 || { echo "Erreur : signature présente mais 'gpg' introuvable." >&2; exit 1; }
+            gpg_log="$(mktemp "/tmp/registry-cli-gpg-verify.XXXXXX")"
+            if gpg --batch --status-fd 1 --verify "$asc" "$mf" 2>&1 | tee "$gpg_log" && grep -q '^\[GNUPG:\] GOODSIG' "$gpg_log"; then
+                n_signed=$((n_signed + 1))
+            else
+                echo "Erreur : signature GPG invalide pour ${mf#"${src_v2}"/}. Abandon." >&2
+                rm -f "$gpg_log"
+                exit 1
+            fi
             rm -f "$gpg_log"
-            exit 1
-        fi
-        rm -f "$gpg_log"
-    else
-        echo "==> Aucune signature (.asc) trouvée pour ${archive}."
-        if [[ "$require_signature" == "true" ]]; then
-            echo "Erreur : --require-signature est activé, signature obligatoire. Abandon." >&2
-            exit 1
-        fi
-        echo "    Poursuite sans vérification de signature (utilisez --require-signature pour l'exiger)."
+        done
+        echo "    ${n_signed} manifest(s) signé(s) et vérifié(s), ${n_unsigned} non signé(s)."
     fi
 
-    # --- 3. Extraction ---
-    local workdir; workdir="$(mktemp -d "/tmp/registry-cli-upload.XXXXXX")"
-    trap 'rm -rf "'"$workdir"'"' EXIT
-    echo "==> Extraction de l'archive..."
-    tar -C "$workdir" -xzf "$archive"
-    [[ -d "${workdir}/v2" ]] || { echo "Erreur : l'archive ne contient pas de répertoire v2/." >&2; exit 1; }
-
-    if [[ -f "${workdir}/registrish-archive.json" ]]; then
-        echo "==> Métadonnées de l'archive :"
-        cat "${workdir}/registrish-archive.json"
+    if [[ "$require_signature" == "true" && "$n_signed" -eq 0 ]]; then
+        echo "Erreur : --require-signature est activé, au moins un manifest signé est requis. Abandon." >&2
+        exit 1
     fi
 
     # --- 4. Fusion dans la registry cible ---
     mkdir -p "${root}/v2"
     echo "==> Fusion de v2/ dans ${root}..."
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a "${workdir}/v2/" "${root}/v2/"
+        rsync -a "${src_v2}/" "${root}/v2/"
     else
         echo "    ('rsync' absent, repli sur cp -a)"
-        cp -a "${workdir}/v2/." "${root}/v2/"
+        cp -a "${src_v2}/." "${root}/v2/"
     fi
     echo "    OK."
 
@@ -1964,7 +2119,7 @@ cmd_list() {
     local root="" as_json="false"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r|--registry-root) root="$2"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --json) as_json="true"; shift ;;
             -h|--help) usage_list; exit 0 ;;
             *) echo "Option inconnue pour 'list' : $1" >&2; exit 1 ;;
@@ -2154,11 +2309,12 @@ gc_image() {
                 removed_manifests=$((removed_manifests + 1))
                 if [[ "$dry_run" == "true" ]]; then
                     echo "    [dry-run] manifest orphelin : $f"
+                    [[ -f "${f}.asc" ]] && echo "    [dry-run] signature orpheline : ${f}.asc"
                 else
-                    rm -f "$f"
+                    rm -f "$f" "${f}.asc"
                 fi
             fi
-        done < <(find "$manifests_dir" -maxdepth 1 -type f -name 'sha256:*' 2>/dev/null)
+        done < <(find "$manifests_dir" -maxdepth 1 -type f -name 'sha256:*' ! -name '*.asc' 2>/dev/null)
     fi
 
     if [[ -d "$blobs_dir" ]]; then
@@ -2190,10 +2346,10 @@ cmd_remove() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r|--registry-root) root="$2"; shift 2 ;;
-            --image) image="$2"; shift 2 ;;
-            --tag) tag="$2"; shift 2 ;;
-            --digest) digest="$2"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --image) image="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --tag) tag="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --digest) digest="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --gc) gc="true"; shift ;;
             --no-gc) gc="false"; shift ;;
             --purge-if-empty) purge_if_empty="true"; shift ;;
@@ -2360,7 +2516,7 @@ cmd_gc() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r|--registry-root) root="$2"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             -y|--yes) yes="true"; shift ;;
             --dry-run) dry_run="true"; shift ;;
             --purge-empty-images) purge_empty_images="true"; shift ;;
@@ -2417,6 +2573,177 @@ cmd_gc() {
 }
 
 # ===========================================================================
+# Commande : sign
+# ===========================================================================
+usage_sign() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} sign -r REGISTRY_ROOT (-k KEY_ID | --check) [options]
+
+Signe (ou vérifie) individuellement, avec GPG, chaque manifest CANONIQUE
+(v2/<image>/manifests/sha256:<hex>) d'une registry déjà en place. Ne touche
+jamais aux blobs, aux copies par tag, ni aux artefacts cosign compagnons :
+seuls les manifests eux-mêmes sont signés, ce qui limite le contenu qui
+bouge (et donc la taille des rsync) lors d'une re-signature ou d'un ajout
+de contenu ultérieur.
+
+  -r, --registry-root DIR    Racine filesystem de la registry (obligatoire)
+  -k, --gpg-key KEY_ID       Signe chaque manifest canonique non encore signé
+                                avec cette clé GPG
+      --check                 Ne signe rien : vérifie les .asc déjà présents
+                                (échoue si l'un d'eux est invalide). Incompatible
+                                avec -k
+  -i, --image IMAGE          Limite l'opération à cette image (chemin sous v2/,
+                                ex: library/alpine). Répétable. Par défaut : toute
+                                la registry
+      --gpg-keyring FICHIER   Fichier de clés publiques à importer dans un
+                                trousseau temporaire pour --check (sinon le
+                                trousseau GPG par défaut de l'utilisateur)
+      --force                 Re-signe même les manifests déjà signés (ex: après
+                                rotation de clé). Sans effet avec --check
+      --dry-run               Affiche ce qui serait signé/vérifié sans rien écrire
+  -y, --yes                   Ne pas demander de confirmation
+      --regen-config          Régénère v2/.htaccess après signature (défaut : activé)
+      --no-regen-config       Désactive la régénération de v2/.htaccess
+
+Exemples :
+  ${SCRIPT_NAME} sign -r /srv/registrish -k 0xDEADBEEF
+  ${SCRIPT_NAME} sign -r /srv/registrish -k 0xDEADBEEF -i library/alpine
+  ${SCRIPT_NAME} sign -r /srv/registrish --check
+  ${SCRIPT_NAME} sign -r /srv/registrish -k 0xNEWKEY --force
+EOF
+}
+
+cmd_sign() {
+    local root="" gpg_key="" check="false" gpg_keyring="" force="false"
+    local dry_run="false" yes="false" regen_config="true"
+    local -a images=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -k|--gpg-key) gpg_key="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --check) check="true"; shift ;;
+            -i|--image) images+=("${2:?Erreur : $1 nécessite une valeur.}"); shift 2 ;;
+            --gpg-keyring) gpg_keyring="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --force) force="true"; shift ;;
+            --dry-run) dry_run="true"; shift ;;
+            -y|--yes) yes="true"; shift ;;
+            --regen-config) regen_config="true"; shift ;;
+            --no-regen-config) regen_config="false"; shift ;;
+            -h|--help) usage_sign; exit 0 ;;
+            *) echo "Option inconnue pour 'sign' : $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [[ -n "$root" ]] || { echo "Erreur : -r/--registry-root est obligatoire." >&2; exit 1; }
+    [[ -d "${root}/v2" ]] || { echo "Erreur : répertoire introuvable : ${root}/v2" >&2; exit 1; }
+    if [[ -n "$gpg_key" && "$check" == "true" ]]; then
+        echo "Erreur : -k/--gpg-key et --check sont incompatibles." >&2
+        exit 1
+    fi
+    if [[ -z "$gpg_key" && "$check" == "false" ]]; then
+        echo "Erreur : précisez -k/--gpg-key (signer) ou --check (vérifier)." >&2
+        exit 1
+    fi
+    command -v gpg >/dev/null 2>&1 || { echo "Erreur : 'gpg' est requis." >&2; exit 1; }
+
+    local -a scan_roots=()
+    if [[ "${#images[@]}" -eq 0 ]]; then
+        scan_roots=("${root}/v2")
+    else
+        local img
+        for img in "${images[@]}"; do
+            [[ -d "${root}/v2/${img}" ]] || { echo "Erreur : image introuvable : ${img}" >&2; exit 1; }
+            scan_roots+=("${root}/v2/${img}")
+        done
+    fi
+
+    local -a manifests_all=()
+    local scan_root mf
+    for scan_root in "${scan_roots[@]}"; do
+        while IFS= read -r mf; do
+            manifests_all+=("$mf")
+        done < <(find "$scan_root" -type f | grep -E '/manifests/sha256:[0-9a-f]{64}$' | sort)
+    done
+
+    if [[ "$check" == "true" ]]; then
+        echo "==> Vérification des signatures GPG des manifests sous ${root}/v2..."
+        local gnupghome_tmp=""
+        if [[ -n "$gpg_keyring" ]]; then
+            gnupghome_tmp="$(mktemp -d "/tmp/registry-cli-gnupg.XXXXXX")"
+            chmod 700 "$gnupghome_tmp"
+            export GNUPGHOME="$gnupghome_tmp"
+            gpg --batch --quiet --import "$gpg_keyring"
+            trap '[[ -n "'"$gnupghome_tmp"'" ]] && rm -rf "'"$gnupghome_tmp"'"' RETURN
+        fi
+
+        local n_valid=0 n_unsigned=0 asc gpg_log
+        for mf in "${manifests_all[@]}"; do
+            asc="${mf}.asc"
+            if [[ ! -f "$asc" ]]; then
+                n_unsigned=$((n_unsigned + 1))
+                continue
+            fi
+            gpg_log="$(mktemp "/tmp/registry-cli-gpg-verify.XXXXXX")"
+            if gpg --batch --status-fd 1 --verify "$asc" "$mf" 2>&1 | tee "$gpg_log" && grep -q '^\[GNUPG:\] GOODSIG' "$gpg_log"; then
+                n_valid=$((n_valid + 1))
+            else
+                echo "Erreur : signature GPG invalide pour ${mf#"${root}"/}." >&2
+                rm -f "$gpg_log"
+                exit 1
+            fi
+            rm -f "$gpg_log"
+        done
+        echo "==> Terminé : ${n_valid} manifest(s) valide(s), ${n_unsigned} non signé(s)."
+        return 0
+    fi
+
+    confirm_or_abort "$yes" "Signer les manifests non signés sous '${root}/v2' avec la clé ${gpg_key} ?"
+
+    local n_to_sign=0 n_already=0 asc
+    for mf in "${manifests_all[@]}"; do
+        asc="${mf}.asc"
+        if [[ "$force" == "false" && -f "$asc" ]]; then
+            n_already=$((n_already + 1))
+        else
+            n_to_sign=$((n_to_sign + 1))
+        fi
+    done
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo "==> [dry-run] ${n_to_sign} manifest(s) seraient signé(s), ${n_already} déjà signé(s) (ignorés)."
+        return 0
+    fi
+
+    echo "==> Signature GPG des manifests avec la clé ${gpg_key}..."
+    local n_signed=0 signed_mf sign_output sign_status any_failed="false"
+    for scan_root in "${scan_roots[@]}"; do
+        sign_status=0
+        sign_output="$(sign_manifests_gpg "$scan_root" "$gpg_key" "$force")" || sign_status=$?
+        [[ "$sign_status" -ne 0 ]] && any_failed="true"
+        if [[ -n "$sign_output" ]]; then
+            while IFS= read -r signed_mf; do
+                echo "    signé : ${signed_mf#"${root}"/v2/}"
+                n_signed=$((n_signed + 1))
+            done <<< "$sign_output"
+        fi
+    done
+    echo "==> Terminé : ${n_signed} manifest(s) signé(s), ${n_already} déjà signé(s) (ignorés)."
+
+    if [[ "$regen_config" == "true" ]]; then
+        echo "==> Régénération de v2/.htaccess..."
+        regen_apache2_config "$root"
+        echo "==> Régénération de la page index.html..."
+        regen_index_html "$root"
+    fi
+
+    if [[ "$any_failed" == "true" ]]; then
+        echo "Erreur : échec de la signature GPG d'au moins un manifest." >&2
+        exit 1
+    fi
+}
+
+# ===========================================================================
 # Commande : index
 # ===========================================================================
 usage_index() {
@@ -2444,7 +2771,7 @@ cmd_index() {
     local root=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r|--registry-root) root="$2"; shift 2 ;;
+            -r|--registry-root) root="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             -h|--help) usage_index; exit 0 ;;
             *) echo "Option inconnue pour 'index' : $1" >&2; exit 1 ;;
         esac
@@ -2506,11 +2833,11 @@ cmd_verify() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -u|--registry-url) registry_url="$2"; shift 2 ;;
-            -i|--image) image="$2"; shift 2 ;;
-            -t|--tag) tag="$2"; shift 2 ;;
-            -d|--digest) digest="$2"; shift 2 ;;
-            -k|--key) key="$2"; shift 2 ;;
+            -u|--registry-url) registry_url="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -i|--image) image="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -t|--tag) tag="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -d|--digest) digest="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -k|--key) key="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --no-expand) no_expand="true"; shift ;;
             -h|--help) usage_verify; exit 0 ;;
             --) shift; extra_args=("$@"); break ;;
@@ -2606,13 +2933,13 @@ cmd_sbom() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -u|--registry-url) registry_url="$2"; shift 2 ;;
-            -i|--image) image="$2"; shift 2 ;;
-            -t|--tag) tag="$2"; shift 2 ;;
-            -d|--digest) digest="$2"; shift 2 ;;
-            -k|--key) key="$2"; shift 2 ;;
-            --type) sbom_type="$2"; shift 2 ;;
-            -o|--output) output="$2"; shift 2 ;;
+            -u|--registry-url) registry_url="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -i|--image) image="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -t|--tag) tag="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -d|--digest) digest="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -k|--key) key="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            --type) sbom_type="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
+            -o|--output) output="${2:?Erreur : $1 nécessite une valeur.}"; shift 2 ;;
             --no-expand) no_expand="true"; shift ;;
             -h|--help) usage_sbom; exit 0 ;;
             --) shift; extra_args=("$@"); break ;;
@@ -2712,7 +3039,7 @@ cmd_completion() {
 #   registry-cli.sh completion > ~/.local/share/bash-completion/completions/registry-cli
 #
 
-_registry_cli_commands="pull mirror upload list remove gc index verify sbom completion"
+_registry_cli_commands="pull mirror upload list remove gc sign index verify sbom completion"
 
 _registry_cli_find_opt_value() {
     local opt_list="$1" opt i
@@ -2762,7 +3089,7 @@ _registry_cli_complete() {
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
-        -r|--registry-root|--from-dir)
+        -r|--registry-root|--from-dir|--to-dir)
             COMPREPLY=( $(compgen -d -- "$cur") )
             return 0
             ;;
@@ -2803,13 +3130,13 @@ _registry_cli_complete() {
     local opts=""
     case "$cmd" in
         pull)
-            opts="-i --image -t --tag -d --digest -c --config -o --output -k --gpg-key --from-dir --source --arch --os --keep-workdir --keep-going --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
+            opts="-i --image -t --tag -d --digest -c --config -o --output --to-dir -k --gpg-key --from-dir --source --arch --os --keep-workdir --keep-going --with-signatures --sig-from-dir --att-from-dir --sbom-from-dir -h --help"
             ;;
         mirror)
             opts="-c --config -r --registry-root --with-signatures --keep-going --dry-run --regen-config --no-regen-config --keep-workdir -h --help"
             ;;
         upload)
-            opts="-a --archive -r --registry-root --regen-config --no-regen-config --require-signature --skip-checksum --gpg-keyring -h --help"
+            opts="-a --archive --from-dir -r --registry-root --regen-config --no-regen-config --require-signature --skip-checksum --gpg-keyring -h --help"
             ;;
         list)
             opts="-r --registry-root --json -h --help"
@@ -2819,6 +3146,9 @@ _registry_cli_complete() {
             ;;
         gc)
             opts="-r --registry-root --purge-empty-images --no-purge-empty-images -y --yes --dry-run --regen-config --no-regen-config -h --help"
+            ;;
+        sign)
+            opts="-r --registry-root -k --gpg-key --check -i --image --gpg-keyring --force --dry-run -y --yes --regen-config --no-regen-config -h --help"
             ;;
         index)
             opts="-r --registry-root -h --help"
@@ -2872,6 +3202,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         list) cmd_list "$@" ;;
         remove) cmd_remove "$@" ;;
         gc) cmd_gc "$@" ;;
+        sign) cmd_sign "$@" ;;
         index) cmd_index "$@" ;;
         verify) cmd_verify "$@" ;;
         sbom) cmd_sbom "$@" ;;

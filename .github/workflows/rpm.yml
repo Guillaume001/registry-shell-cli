@@ -68,7 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           registry-cli --version
-          for cmd in pull mirror upload list remove gc index verify sbom completion; do
+          for cmd in pull mirror upload list remove gc sign index verify sbom completion; do
             registry-cli "$cmd" --help >/dev/null
           done
           MANWIDTH=80 man registry-cli | grep -q "manage a static"
