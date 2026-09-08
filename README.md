@@ -70,12 +70,18 @@ sudo cp registry-cli.sh /usr/local/bin/registry-cli
 
 Un `.spec` (`packaging/rpm/registry-cli.spec`) et une CI GitHub Actions
 (`.github/workflows/rpm.yml`) construisent et testent un paquet `noarch`
-sur AlmaLinux 9 et 10 à chaque push touchant le script, les pages man ou le
-`.spec`. Dépendances fortes : `bash`, `rsync`, `jq`. Dépendances faibles
-(`Recommends`, non bloquantes) : `skopeo`, `gnupg2`, `cosign` — nécessaires
-seulement pour certaines fonctionnalités (voir la section DEPENDENCIES des
-pages man). Le paquet installe le binaire sous `/usr/bin/registry-cli`, les
-pages man anglaise et française, et la complétion bash.
+(binaire `.rpm` **et** source `.src.rpm`) sur AlmaLinux 9 et 10 à chaque
+push touchant le script, les pages man ou le `.spec`. Dépendances fortes :
+`bash`, `rsync`, `jq`. Dépendances faibles (`Recommends`, non bloquantes) :
+`skopeo`, `gnupg2`, `cosign` — nécessaires seulement pour certaines
+fonctionnalités (voir la section DEPENDENCIES des pages man). Le paquet
+installe le binaire sous `/usr/bin/registry-cli`, les pages man anglaise et
+française, et la complétion bash.
+
+Le workflow publie, pour chaque version cible (`el9`, `el10`), à la fois le
+`.rpm` binaire (artefact `registry-cli-elN.rpm`) et le `.src.rpm`
+correspondant (artefact `registry-cli-elN.src.rpm`), téléchargeables depuis
+l'onglet "Actions" du run concerné.
 
 Construction locale (sur une machine RPM, ou via un conteneur AlmaLinux) :
 
@@ -89,7 +95,9 @@ tar -C /tmp/src -czf "/tmp/src/${pkgdir}.tar.gz" "${pkgdir}"
 rpmdev-setuptree
 cp "/tmp/src/${pkgdir}.tar.gz" ~/rpmbuild/SOURCES/
 cp packaging/rpm/registry-cli.spec ~/rpmbuild/SPECS/
-rpmbuild -bb ~/rpmbuild/SPECS/registry-cli.spec
+rpmbuild -ba ~/rpmbuild/SPECS/registry-cli.spec
+# Binaire : ~/rpmbuild/RPMS/noarch/registry-cli-${version}-1.elN.noarch.rpm
+# Source  : ~/rpmbuild/SRPMS/registry-cli-${version}-1.elN.src.rpm
 ```
 
 ### Pages de manuel
