@@ -55,13 +55,15 @@ jobs:
           rpmdev-setuptree
           cp "/tmp/src/registry-cli-${{ steps.version.outputs.version }}.tar.gz" ~/rpmbuild/SOURCES/
           cp packaging/rpm/registry-cli.spec ~/rpmbuild/SPECS/
-          rpmbuild -bb ~/rpmbuild/SPECS/registry-cli.spec
+          rpmbuild -ba ~/rpmbuild/SPECS/registry-cli.spec
 
       - name: Install the built RPM
         run: |
           set -euo pipefail
           rpm_file="$(find ~/rpmbuild/RPMS -name '*.rpm')"
+          srpm_file="$(find ~/rpmbuild/SRPMS -name '*.src.rpm')"
           echo "rpm_file=${rpm_file}" >> "$GITHUB_ENV"
+          echo "srpm_file=${srpm_file}" >> "$GITHUB_ENV"
           dnf install -y "${rpm_file}"
 
       - name: Smoke test
@@ -80,3 +82,9 @@ jobs:
         with:
           name: registry-cli-el${{ matrix.almalinux }}.rpm
           path: ${{ env.rpm_file }}
+
+      - name: Upload built SRPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-cli-el${{ matrix.almalinux }}.src.rpm
+          path: ${{ env.srpm_file }}
